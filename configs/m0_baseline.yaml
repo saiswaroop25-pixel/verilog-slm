@@ -1,0 +1,6 @@
+# Flat SFT baseline. Nothing clever here, and that's the point (Part 5).
+extends: base.yaml
+run_name: m0
+
+sampler:
+  type: flat

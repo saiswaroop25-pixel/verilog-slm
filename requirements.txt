@@ -1,0 +1,18 @@
+# Pinned per Part 0 hygiene notes: Colab silently upgrades packages
+# between sessions and transformers breaks LoRA loading regularly.
+#
+# Core deps (data pipeline, verify harness, eval metrics) are CPU-only and
+# runnable anywhere. Train/infer deps pull in the CUDA stack and are only
+# needed on the Colab GPU runtime -- install with:
+#   pip install -r requirements.txt -r requirements-train.txt
+
+pyyaml==6.0.2
+numpy==1.26.4
+datasketch==1.6.5
+pyverilog==1.3.0
+pytest==8.3.3
+
+# --- optional, used only if present on PATH, never a hard dependency ---
+# iverilog (compile/simulate)   -- apt-get install iverilog
+# yosys    (synthesizability)   -- apt-get install yosys
+# verible  (lint + formatting)  -- https://github.com/chipsalliance/verible/releases

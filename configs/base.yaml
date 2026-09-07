@@ -1,0 +1,37 @@
+# Shared across every training config: model, tokenizer, seq len, seed.
+# M0 and M1 both extend this file. Never fork these values per-config --
+# see Part 1: "M0 and M1 must differ in exactly one thing: the sampler."
+
+model:
+  name: Qwen/Qwen2.5-Coder-1.5B-Instruct
+
+data:
+  corpus_path: artifacts/corpus.jsonl
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_compute_dtype: bfloat16   # use float16 on T4 (no bf16 support)
+  bnb_4bit_use_double_quant: true
+
+lora:
+  r: 32                              # 16 for 0.5B debug runs, 64 for 6.7B stretch goal
+  alpha: 64                          # keep alpha = 2r
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+training:
+  seq_len: 2048
+  per_device_batch_size: 4           # 2 on T4 for the 3B model; raise grad_accum to compensate
+  grad_accum_steps: 8                # effective batch = per_device_batch_size * grad_accum_steps = 32
+  lr: 2.0e-4
+  scheduler: cosine
+  warmup_ratio: 0.03
+  epochs: 3
+  save_steps: 200
+  gradient_checkpointing: true
+  bf16: true                         # set false + fp16 path on T4
+  seed: 1337
+
+output:
+  artifacts_dir: artifacts

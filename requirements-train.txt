@@ -1,0 +1,10 @@
+# GPU-runtime extras (Colab). Kept separate from requirements.txt so the
+# data/verify/eval side of the repo installs and runs on a bare CPU
+# machine (or a CPU-only Colab runtime for the verification passes, per
+# Part 11's compute-budget advice) without pulling in a multi-GB CUDA stack.
+torch==2.4.1
+transformers==4.44.2
+peft==0.12.0
+bitsandbytes==0.43.3
+accelerate==0.34.2
+sentencepiece==0.2.0

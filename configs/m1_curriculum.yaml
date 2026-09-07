@@ -1,0 +1,20 @@
+# Curriculum SFT: same budget as M0, different sampler only (Part 7/8).
+#
+# `sampler.assert_against` points at M0's run_meta.json; sft.py asserts
+# max_steps and the base-checkpoint hash both match before training
+# starts, and fails loudly rather than silently invalidating the ablation
+# (Part 8). Run M0 first.
+extends: base.yaml
+run_name: m1
+
+sampler:
+  type: curriculum
+  assert_against: artifacts/m0/run_meta.json
+  diagnostic_table_path: artifacts/m0_diagnostic.json
+  phases:
+    - frac: 0.3
+      tier_mix: {T1: 0.70, T2: 0.30}
+    - frac: 0.4
+      tier_mix: {T1: 0.25, T2: 0.40, T3: 0.35}
+    - frac: 0.3
+      tier_mix: {T1: 0.15, T2: 0.25, T3: 0.35, T4: 0.25}
