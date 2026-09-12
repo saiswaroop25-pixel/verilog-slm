@@ -1,0 +1,18 @@
+# Same purpose as m0_memcheck.yaml, testing whether per_device_batch_size=2
+# (instead of 1) fits T4 memory at the real seq_len=2048 -- batch=1 avoided
+# the OOM but is so GPU-inefficient (one example at a time) that the real
+# M0 run would take ~36 hours at its measured throughput (0.06 GPU-h for
+# 5 steps -> ~43s/step -> ~2998 steps). If batch=2 fits, it should run
+# meaningfully faster per effective-batch-equivalent than batch=1 without
+# needing to touch seq_len (and therefore without truncating more of the
+# corpus than base.yaml's original design intended).
+#
+#   python -m src.train.sft --config configs/m0_memcheck_bs2.yaml
+extends: m0_baseline.yaml
+run_name: m0_memcheck_bs2
+
+training:
+  max_steps: 5
+  save_steps: 10000
+  per_device_batch_size: 2
+  grad_accum_steps: 16   # effective batch stays 32
