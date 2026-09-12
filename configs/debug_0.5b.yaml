@@ -22,3 +22,14 @@ lora:
 training:
   max_steps: 20         # just enough to exercise the loop, not a real run
   save_steps: 10        # exercise the checkpoint-save path at least once
+  # base.yaml's per_device_batch_size=4 / seq_len=2048 OOM'd a T4 even on
+  # this 0.5B model (13.35 GiB allocated, tried to allocate 4 GiB more --
+  # identical across two attempted code-level fixes, which rules those
+  # out and points at genuinely needing less memory headroom, not a
+  # checkpointing/attention bug). This smoke test only needs to prove the
+  # training loop runs, not validate the real batch size, so shrink hard;
+  # the real per-model/seq_len budget for T4 is a separate, deliberate
+  # decision to make before the real M0 run (see Part 13's fallback: drop
+  # per_device_batch_size, raise grad_accum_steps to hold effective batch).
+  per_device_batch_size: 1
+  seq_len: 256
