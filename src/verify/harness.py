@@ -73,10 +73,17 @@ def _parse_testbench_result(stdout: str) -> bool:
 
     These testbenches print explicit mismatch counts and a final verdict
     string; a zero exit code alone is NOT sufficient (a testbench can exit
-    0 having printed hundreds of mismatches). We look for the two
-    conventions used across VerilogEval v2 / RTLLM v2 harnesses:
-      - an explicit "Mismatches: N" / "mismatch count: N" line -> ok iff N==0
-      - an explicit "ALL TESTS PASSED" / "TESTBENCH PASSED" sentinel
+    0 having printed hundreds of mismatches). We look for the conventions
+    used across VerilogEval v2 / RTLLM v2 harnesses -- verified against the
+    live testbench sources of both benchmarks, not guessed:
+      - VerilogEval v2 spec-to-rtl: "Mismatches: N in M samples" -> ok iff N==0
+      - RTLLM v2: "===========Your Design Passed===========" (dash count and
+        spacing vary per-problem -- checked with flexible whitespace, no
+        anchoring to a specific run of '=') on success; failure messages are
+        NOT standardized across RTLLM's 50 testbenches (seen: "Test
+        completed with N/100 failures", "Test failed: ...", "Failed at...",
+        bare "Error: ..." lines), so failure is the absence of the pass
+        sentinel, not a positive failure match.
       - a "$finish" firing at all is NOT taken as pass; absence of any
         recognised sentinel is treated as a failure so silent designs
         don't get credited.
@@ -88,8 +95,8 @@ def _parse_testbench_result(stdout: str) -> bool:
     if re.search(r"ALL\s*TESTS?\s*PASSED|TESTBENCH\s*PASSED|Hint:\s*Total\s*mismatched\s*samples\s*is\s*0", stdout, re.IGNORECASE):
         return True
 
-    if re.search(r"FAIL|ERROR|mismatch", stdout, re.IGNORECASE):
-        return False
+    if re.search(r"your\s+design\s+passed", stdout, re.IGNORECASE):
+        return True
 
     return False
 

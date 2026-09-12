@@ -25,6 +25,22 @@ def test_parse_testbench_exit_zero_with_failures_is_not_a_pass():
     assert _parse_testbench_result("running...\nFAIL: output mismatch at time 40\n$finish called\n") is False
 
 
+def test_parse_testbench_rtllm_pass_sentinel():
+    # RTLLM v2's actual sentinel (verified against all 50 of its live
+    # testbenches) -- dash-count/spacing varies per problem, so this must
+    # match loosely rather than anchoring to a specific run of '='.
+    assert _parse_testbench_result("===========Your Design Passed===========\n") is True
+    assert _parse_testbench_result("=========== Your Design Passed ===========\n") is True
+
+
+def test_parse_testbench_rtllm_fail_is_not_a_pass():
+    # RTLLM failure messages are not standardized across problems (unlike
+    # the pass sentinel) -- absence of "Your Design Passed" must be enough
+    # on its own to score as a failure.
+    assert _parse_testbench_result("===========Test completed with 3 / 100 failures===========\n") is False
+    assert _parse_testbench_result("Test failed: a = 1, b = 0, expected = 1\n") is False
+
+
 def test_parse_testbench_silent_output_is_fail_not_pass():
     assert _parse_testbench_result("$finish called at time 100\n") is False
 

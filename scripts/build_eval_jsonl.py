@@ -4,19 +4,15 @@ eval jsonl schema (Part 3's "eval only" sources).
 Target schema, one row per problem:
     {
       "id": "...", "instruction": "...", "code": "<reference solution>",
-      "testbench": "<the benchmark's own testbench>",
+      "testbench": "<what gets compiled alongside the model's generated
+                     code as testbench.v -- see per-benchmark notes below>",
       "top_module": "...", "tags": {"tier": "T1".."T4"}
     }
 
-VerilogEval and RTLLM both ship one directory per problem containing a
-spec/prompt file, a reference solution, and a testbench, but the exact
-filenames differ across release tags of each repo (both have reorganised
-their layout at least once). Rather than hardcode a glob that silently
-finds zero files against whatever tag you happen to `git clone`, this
-script fails loudly and tells you what it found, so you fix the three
-glob patterns below once against the tag you're actually using and move
-on -- a wrong eval set silently scored as empty is a much worse failure
-mode than an ImportError-style crash here.
+Both benchmarks' actual layout and testbench conventions were inspected
+directly against a live clone before writing this (not guessed from
+memory) -- an earlier version of this script guessed wrong on almost
+every count, so the notes below are load-bearing, not decorative.
 
     python -m scripts.build_eval_jsonl --src /tmp/verilogeval --out data/eval/verilogeval_v2.jsonl --benchmark verilogeval
     python -m scripts.build_eval_jsonl --src /tmp/rtllm --out data/eval/rtllm_v2.jsonl --benchmark rtllm
@@ -25,86 +21,157 @@ mode than an ImportError-style crash here.
 from __future__ import annotations
 
 import argparse
+import glob
+import os
+import re
 from pathlib import Path
 
 from src.data.tagger import tag_example
 from src.utils.io_utils import write_jsonl
 
-# Adjust these three per the exact repo tag you cloned -- see module
-# docstring. Left as an explicit, greppable config block rather than
-# buried string literals.
-GLOB_PATTERNS = {
-    "verilogeval": {
-        "problem_dirs": "**/Prob*",
-        "spec_file": "prompt.txt",
-        "ref_file": "ref.sv",
-        "tb_file": "testbench.sv",
-    },
-    "rtllm": {
-        "problem_dirs": "*/",
-        "spec_file": "design_description.txt",
-        "ref_file": "*.v",
-        "tb_file": "testbench.v",
-    },
-}
+_RTLLM_MODULE_NAME_RE = re.compile(r"[Mm]odule\s+[Nn]ame\s*:\s*\n?\s*(\w+)")
 
 
-def build(src: str, out: str, benchmark: str) -> None:
-    patterns = GLOB_PATTERNS[benchmark]
-    src_path = Path(src)
-    problem_dirs = sorted(src_path.glob(patterns["problem_dirs"]))
+def build_verilogeval(src: str, out: str) -> None:
+    """VerilogEval v2's `dataset_spec-to-rtl/` directory is FLAT -- there
+    are no per-problem subdirectories. Each problem is three files sharing
+    a prefix: `<prefix>_prompt.txt`, `<prefix>_ref.sv`, `<prefix>_test.sv`.
 
-    if not problem_dirs:
+    Every prompt asks the model to implement a module literally named
+    `TopModule` (fixed across the whole benchmark). The testbench does
+    DIFFERENTIAL testing: it instantiates the reference solution under a
+    *different* name, `RefModule` (from `_ref.sv`), side by side with the
+    model's `TopModule`, and compares their outputs -- so `_ref.sv` must be
+    compiled together with the testbench, not treated as a separate
+    "reference only" artifact. Concatenating `_ref.sv` + `_test.sv` into
+    this row's "testbench" field reproduces that with zero changes needed
+    to the harness's plain `iverilog design.v testbench.v` compile step.
+
+    Pass/fail: `$display("Mismatches: %1d in %1d samples", ...)` -- already
+    matched by the harness's existing "Mismatches: N" parsing.
+    """
+    data_dir = Path(src) / "dataset_spec-to-rtl"
+    prompt_files = sorted(data_dir.glob("*_prompt.txt"))
+    if not prompt_files:
         raise SystemExit(
-            f"[build_eval_jsonl] found 0 problem directories under {src} matching "
-            f"'{patterns['problem_dirs']}'. The upstream repo layout has likely "
-            f"changed since GLOB_PATTERNS['{benchmark}'] was written -- inspect "
-            f"`find {src} -maxdepth 3` and fix the patterns at the top of this file."
+            f"[build_eval_jsonl] found 0 '*_prompt.txt' files under {data_dir}. "
+            f"VerilogEval has reorganised this layout before -- inspect "
+            f"`find {src} -maxdepth 2` and update build_verilogeval() to match."
         )
 
     rows = []
     n_missing = 0
-    for pdir in problem_dirs:
-        if not pdir.is_dir():
-            continue
-        spec_matches = list(pdir.glob(patterns["spec_file"]))
-        ref_matches = list(pdir.glob(patterns["ref_file"]))
-        tb_matches = list(pdir.glob(patterns["tb_file"]))
-        if not (spec_matches and ref_matches and tb_matches):
+    for prompt_path in prompt_files:
+        prefix = prompt_path.name[: -len("_prompt.txt")]
+        ref_path = data_dir / f"{prefix}_ref.sv"
+        test_path = data_dir / f"{prefix}_test.sv"
+        if not (ref_path.exists() and test_path.exists()):
             n_missing += 1
             continue
 
-        code = ref_matches[0].read_text(encoding="utf-8", errors="ignore")
-        tags = tag_example(code)
-        top_module_match = None
-        import re
-        m = re.search(r"\bmodule\s+(\w+)", code)
-        top_module = m.group(1) if m else "top"
+        ref_code = ref_path.read_text(encoding="utf-8", errors="ignore")
+        test_code = test_path.read_text(encoding="utf-8", errors="ignore")
+        instruction = prompt_path.read_text(encoding="utf-8", errors="ignore").strip()
+        tier = tag_example(ref_code).tier
 
         rows.append({
-            "id": f"{benchmark}_{pdir.name}",
-            "instruction": spec_matches[0].read_text(encoding="utf-8", errors="ignore").strip(),
-            "code": code,
-            "testbench": tb_matches[0].read_text(encoding="utf-8", errors="ignore"),
-            "top_module": top_module,
-            "tags": {"tier": tags.tier},
+            "id": f"verilogeval_{prefix}",
+            "instruction": instruction,
+            "code": ref_code,
+            "testbench": ref_code + "\n" + test_code,
+            "top_module": "TopModule",
+            "tags": {"tier": tier},
         })
 
     if n_missing:
-        print(f"[build_eval_jsonl] WARNING: {n_missing}/{len(problem_dirs)} problem dirs "
-              f"were missing one of spec/ref/testbench and were skipped.")
+        print(f"[build_eval_jsonl] WARNING: {n_missing} prompt files were missing "
+              f"a matching _ref.sv/_test.sv and were skipped.")
 
     write_jsonl(out, rows)
     print(f"[build_eval_jsonl] wrote {len(rows)} problems -> {out}")
+
+
+def build_rtllm(src: str, out: str) -> None:
+    """RTLLM v2 is organised as Category/Subcategory/<problem>/, nested to
+    varying depth -- discover problems by the presence of
+    `design_description.txt` rather than assuming a fixed depth.
+
+    Each problem dir has: `design_description.txt` (spec, which states the
+    required module name as "Module name:\\n    <name>"), `testbench.v`
+    (a SELF-CHECKING testbench -- it computes the expected result itself
+    and instantiates the model's module directly under the name from
+    design_description.txt; no separate reference file is needed at
+    compile time), and `verified_*.v` (the reference solution, used here
+    only for tagging/dedup -- its internal module name is a differently-
+    prefixed name than what the model must produce, e.g. `adder_16bit`
+    (required) vs. `verified_adder_16bit` (reference file's own name), so
+    it is NOT concatenated into the testbench the way VerilogEval's is).
+
+    Pass/fail sentinel: "===========Your Design Passed==========="
+    (dash count and spacing vary per problem) -- confirmed present in all
+    50/50 of this benchmark's testbenches; matched by the harness with
+    flexible whitespace, not a literal string compare. Failure messages
+    are NOT standardized across problems, so absence of the pass sentinel
+    is what the harness treats as failure.
+    """
+    desc_paths = sorted(glob.glob(os.path.join(src, "**", "design_description.txt"), recursive=True))
+    if not desc_paths:
+        raise SystemExit(
+            f"[build_eval_jsonl] found 0 'design_description.txt' files under {src}. "
+            f"RTLLM has reorganised this layout before -- inspect "
+            f"`find {src} -name design_description.txt` and update build_rtllm() to match."
+        )
+
+    rows = []
+    n_missing = 0
+    for desc_path_str in desc_paths:
+        desc_path = Path(desc_path_str)
+        problem_dir = desc_path.parent
+        tb_path = problem_dir / "testbench.v"
+        ref_matches = list(problem_dir.glob("verified_*.v"))
+        if not (tb_path.exists() and ref_matches):
+            n_missing += 1
+            continue
+
+        instruction = desc_path.read_text(encoding="utf-8", errors="ignore").strip()
+        name_match = _RTLLM_MODULE_NAME_RE.search(instruction)
+        if not name_match:
+            n_missing += 1
+            continue
+        top_module = name_match.group(1)
+
+        ref_code = ref_matches[0].read_text(encoding="utf-8", errors="ignore")
+        testbench = tb_path.read_text(encoding="utf-8", errors="ignore")
+        tier = tag_example(ref_code).tier
+
+        rows.append({
+            "id": f"rtllm_{problem_dir.name}",
+            "instruction": instruction,
+            "code": ref_code,
+            "testbench": testbench,
+            "top_module": top_module,
+            "tags": {"tier": tier},
+        })
+
+    if n_missing:
+        print(f"[build_eval_jsonl] WARNING: {n_missing}/{len(desc_paths)} problem dirs "
+              f"were missing testbench.v/verified_*.v or a parseable module name, "
+              f"and were skipped.")
+
+    write_jsonl(out, rows)
+    print(f"[build_eval_jsonl] wrote {len(rows)} problems -> {out}")
+
+
+BUILDERS = {"verilogeval": build_verilogeval, "rtllm": build_rtllm}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--benchmark", required=True, choices=list(GLOB_PATTERNS))
+    ap.add_argument("--benchmark", required=True, choices=list(BUILDERS))
     args = ap.parse_args()
-    build(args.src, args.out, args.benchmark)
+    BUILDERS[args.benchmark](args.src, args.out)
 
 
 if __name__ == "__main__":
