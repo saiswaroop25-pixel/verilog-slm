@@ -1,0 +1,21 @@
+# Confirms the REAL M0 model (1.5B) fits in T4 memory at the REAL
+# seq_len=2048, before committing to the full multi-hour M0 run. The
+# 0.5B debug pass (configs/debug_0.5b.yaml) only proved the code path
+# works -- it used a much smaller seq_len (256) to guarantee it fit, so
+# it does NOT prove the revised base.yaml batch/seq_len settings are
+# actually enough headroom for the real 1.5B model. This does, cheaply
+# (a handful of steps, not a real training run).
+#
+#   python -m src.train.sft --config configs/m0_memcheck.yaml
+#
+# run_name is deliberately not "m0" so this can never be mistaken for the
+# real baseline or feed M1's assert_against. If this OOMs, drop
+# per_device_batch_size further is not an option (already at 1) --
+# instead reduce training.seq_len in base.yaml (this changes the real M0
+# run too, so re-run this check again after any such change).
+extends: m0_baseline.yaml
+run_name: m0_memcheck
+
+training:
+  max_steps: 5
+  save_steps: 10000   # effectively never during this short check

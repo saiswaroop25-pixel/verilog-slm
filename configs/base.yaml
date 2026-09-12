@@ -11,7 +11,12 @@ data:
 quantization:
   load_in_4bit: true
   bnb_4bit_quant_type: nf4
-  bnb_4bit_compute_dtype: bfloat16   # use float16 on T4 (no bf16 support)
+  # T4 (Turing) has no native bf16 tensor-core support -- this file's own
+  # comment always said so, but the value here contradicted it (a
+  # leftover from copying Part 2's generic config table without a
+  # hardware-specific override). On an L4/A100, flip this and
+  # training.bf16 below back to bfloat16/true.
+  bnb_4bit_compute_dtype: float16
   bnb_4bit_use_double_quant: true
 
 lora:
@@ -22,15 +27,22 @@ lora:
 
 training:
   seq_len: 2048
-  per_device_batch_size: 4           # 2 on T4 for the 3B model; raise grad_accum to compensate
-  grad_accum_steps: 8                # effective batch = per_device_batch_size * grad_accum_steps = 32
+  # Revised after a real OOM on a T4: per_device_batch_size=4/seq_len=2048
+  # ran out of memory (13.35 GiB allocated, +4 GiB requested, on a 14.56
+  # GiB T4) even for a 0.5B debug model, so 1.5B/3B were never going to
+  # fit as originally configured. Dropped batch size, raised grad_accum
+  # to hold the effective batch at 32 -- confirm this fits with a short
+  # trial (see configs/m0_memcheck.yaml) before committing to the full
+  # multi-hour M0 run.
+  per_device_batch_size: 1
+  grad_accum_steps: 32               # effective batch = per_device_batch_size * grad_accum_steps = 32
   lr: 2.0e-4
   scheduler: cosine
   warmup_ratio: 0.03
   epochs: 3
   save_steps: 200
   gradient_checkpointing: true
-  bf16: true                         # set false + fp16 path on T4
+  bf16: false                        # T4 has no native bf16 -- fp16 path (see quantization block above)
   seed: 1337
 
 output:
