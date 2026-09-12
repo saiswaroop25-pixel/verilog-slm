@@ -2,9 +2,24 @@
 # data/verify/eval side of the repo installs and runs on a bare CPU
 # machine (or a CPU-only Colab runtime for the verification passes, per
 # Part 11's compute-budget advice) without pulling in a multi-GB CUDA stack.
-torch==2.4.1
-transformers==4.44.2
-peft==0.12.0
-bitsandbytes==0.43.3
-accelerate==0.34.2
-sentencepiece==0.2.0
+#
+# torch is intentionally NOT listed here. Colab preinstalls a torch build
+# that's already matched to that VM's CUDA driver; `pip install torch==X`
+# either fails outright once X ages out of what's published for the
+# runtime's Python version (exactly what happened with the first pin this
+# file shipped with -- 2.4.1 stopped resolving once Colab moved to a newer
+# Python), or worse, silently swaps in a build that doesn't match the GPU.
+# Use whatever Colab already has; notebooks/00_setup.ipynb prints
+# `torch.__version__` and `torch.version.cuda` right after this install
+# step so the actual versions used are logged per Part 0 hygiene, without
+# this repo trying to pin a moving target it doesn't control.
+#
+# The rest are minimum-version pins, not exact -- loose enough to track
+# whatever torch Colab ships, tight enough to rule out genuinely
+# incompatible old releases (e.g. peft<0.12 has known issues loading
+# adapters trained under later transformers versions).
+transformers>=4.46
+peft>=0.13
+bitsandbytes>=0.44
+accelerate>=0.34
+sentencepiece>=0.2.0
