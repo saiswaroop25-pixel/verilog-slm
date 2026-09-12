@@ -20,6 +20,14 @@
 # adapters trained under later transformers versions).
 transformers>=4.46
 peft>=0.13
-bitsandbytes>=0.44
+# bitsandbytes: transformers enforces its own minimum at import time
+# (BITSANDBYTES_MIN_VERSION) independent of what's pinned here -- hit in
+# practice as "ImportError: ... requires bitsandbytes >=0.46.1" when a
+# Colab VM already had an older bitsandbytes satisfying a looser floor
+# like >=0.44, which pip then left untouched (same class of bug as the
+# numpy/torch pins above: a satisfied minimum-version constraint doesn't
+# force an upgrade). Track transformers' actual floor here so `pip
+# install -r` upgrades a too-old preinstalled version instead of no-oping.
+bitsandbytes>=0.46.1
 accelerate>=0.34
 sentencepiece>=0.2.0
