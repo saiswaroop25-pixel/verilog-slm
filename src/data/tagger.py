@@ -90,21 +90,52 @@ def _detect_constructs_regex(code: str) -> list[str]:
     return found
 
 
+_pyverilog_parser = None  # lazy singleton -- see _get_pyverilog_parser()
+
+
+def _get_pyverilog_parser():
+    """pyverilog's top-level `parse()` convenience function builds a brand
+    new VerilogParser (and therefore a brand new PLY yacc() grammar/LALR
+    table) on every single call, and its default `debug=True` prints
+    "Generating LALR tables" / "WARNING: N shift/reduce conflicts" to
+    stderr each time too. Called once per training example (tens of
+    thousands of times over a real corpus), that's both a severe,
+    easily-missed performance bug -- confirmed by direct measurement: two
+    separate VerilogParser() constructions each re-trigger the warning,
+    while one shared instance reused across parses triggers it zero times
+    -- and a wall of console spam that looks like a hang. Build the parser
+    exactly once per process (silently, debug=False) and reuse it for
+    every call instead.
+    """
+    global _pyverilog_parser
+    if _pyverilog_parser is None:
+        from pyverilog.vparser.parser import VerilogParser
+        _pyverilog_parser = VerilogParser(debug=False)
+    return _pyverilog_parser
+
+
 def _try_pyverilog_tags(code: str) -> list[str] | None:
     """Return construct tags derived from a real AST, or None if pyverilog
     isn't installed or fails to parse this snippet."""
     try:
         import tempfile
         from pathlib import Path
-        from pyverilog.vparser.parser import parse
+        from pyverilog.vparser.parser import VerilogPreprocessor
     except ImportError:
         return None
 
     try:
+        parser = _get_pyverilog_parser()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "m.v"
             path.write_text(code, encoding="utf-8")
-            ast, _ = parse([str(path)])
+            # Preprocessing (macro/ifdef expansion) is inherently per-file --
+            # unlike the parser/grammar above, this step is cheap (one
+            # `iverilog -E` subprocess call) and isn't worth caching.
+            pp_output = str(Path(tmp) / "preprocess.output")
+            VerilogPreprocessor([str(path)], pp_output).preprocess()
+            text = Path(pp_output).read_text(encoding="utf-8")
+        ast = parser.parse(text, debug=0)
     except Exception:
         return None
 
