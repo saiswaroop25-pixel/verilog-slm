@@ -108,6 +108,13 @@ def load_base_model_and_tokenizer(cfg: dict[str, Any]):
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.bfloat16 if cfg["training"].get("bf16", True) else torch.float16,
+        # Without this, some transformers versions/model classes fall back to
+        # the naive "eager" attention path, which materialises the full
+        # batch x heads x seq_len x seq_len score matrix in memory instead of
+        # using a fused kernel -- at seq_len=2048 that tensor alone is
+        # hundreds of MB *per layer*, and was a real contributor to an
+        # out-of-memory crash observed on a T4 even with a 0.5B model.
+        attn_implementation="sdpa",
     )
     return model, tokenizer
 
@@ -116,6 +123,18 @@ def attach_lora(model, cfg: dict[str, Any]):
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
     model = prepare_model_for_kbit_training(model)
+    # Belt-and-suspenders: prepare_model_for_kbit_training is supposed to
+    # wire this up itself (a hook that makes the input embeddings require
+    # grad), but when the base model is fully frozen (as it is here -- only
+    # the LoRA adapters train), a missing/broken version of that wiring is a
+    # well-documented way for gradient checkpointing to silently stop
+    # actually checkpointing: autograd needs at least one requires_grad=True
+    # tensor flowing into each checkpointed region, or it can end up
+    # retaining full activations anyway, defeating the whole point (and
+    # inflating memory well beyond what a frozen-base + LoRA setup should
+    # need). Calling this explicitly costs nothing if peft already did it.
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     lora_cfg = cfg["lora"]
     peft_config = LoraConfig(
         r=lora_cfg["r"],
@@ -192,6 +211,12 @@ def assert_matches_m0(cfg: dict[str, Any], model, total_steps: int) -> None:
 
 
 def train(cfg: dict[str, Any]) -> None:
+    # Cheap, harmless insurance against allocator fragmentation on small
+    # GPUs (T4/L4) -- torch's CUDA allocator suggested this itself in an
+    # OOM observed during development. Must be set before the first CUDA
+    # op, so as early as possible here.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     set_seed(cfg["training"]["seed"])
     run_dir = resolve_run_dir(cfg)
     log_path = run_dir / "train_log.jsonl"
