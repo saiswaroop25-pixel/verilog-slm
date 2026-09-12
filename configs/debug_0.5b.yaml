@@ -1,0 +1,24 @@
+# Pipeline smoke test only -- NOT a real M0 run (Part 2's "develop and
+# debug on 0.5B" advice). Confirms the actual training code path (QLoRA
+# load, LoRA attach, optimizer/scheduler, batch construction from the
+# flat sampler, checkpoint save) works end to end on this GPU before
+# committing real hours to configs/m0_baseline.yaml.
+#
+#   python -m src.train.sft --config configs/debug_0.5b.yaml
+#
+# Finishes in a couple of minutes on a T4. run_name is deliberately not
+# "m0" so this can never be mistaken for the real baseline, and its
+# artifacts never get pointed at by m1_curriculum.yaml's assert_against.
+extends: m0_baseline.yaml
+run_name: debug_0.5b
+
+model:
+  name: Qwen/Qwen2.5-Coder-0.5B-Instruct
+
+lora:
+  r: 16                # Part 2: 16 for 0.5B, 32 for 1.5-3B, 64 for 6.7B
+  alpha: 32             # keep alpha = 2r (base.yaml's 64 is sized for r=32)
+
+training:
+  max_steps: 20         # just enough to exercise the loop, not a real run
+  save_steps: 10        # exercise the checkpoint-save path at least once
