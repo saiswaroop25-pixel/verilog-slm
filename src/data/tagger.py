@@ -118,6 +118,7 @@ def _try_pyverilog_tags(code: str) -> list[str] | None:
     """Return construct tags derived from a real AST, or None if pyverilog
     isn't installed or fails to parse this snippet."""
     try:
+        import subprocess
         import tempfile
         from pathlib import Path
         from pyverilog.vparser.parser import VerilogPreprocessor
@@ -132,8 +133,26 @@ def _try_pyverilog_tags(code: str) -> list[str] | None:
             # Preprocessing (macro/ifdef expansion) is inherently per-file --
             # unlike the parser/grammar above, this step is cheap (one
             # `iverilog -E` subprocess call) and isn't worth caching.
+            #
+            # VerilogPreprocessor.preprocess() runs this via bare
+            # `subprocess.call(cmd)`, which inherits our stdout/stderr and
+            # floods the console with one "warning: macro X undefined" line
+            # per undefined-macro reference -- expected and harmless on
+            # RTLCoder/MG-Verilog (standalone snippets routinely reference
+            # parameters from an original file's now-absent `include`), but
+            # alarming at corpus scale. Build the same command it would
+            # (reusing its cmd-building logic rather than duplicating the
+            # iverilog-path/include/define handling) and run it ourselves
+            # with output suppressed; a genuine preprocessing failure still
+            # surfaces the same way -- as a non-zero-effect parse that this
+            # function's outer `except Exception: return None` falls back
+            # to regex tagging for.
             pp_output = str(Path(tmp) / "preprocess.output")
-            VerilogPreprocessor([str(path)], pp_output).preprocess()
+            preprocessor = VerilogPreprocessor([str(path)], pp_output)
+            subprocess.run(preprocessor.iv + list(preprocessor.filelist),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for temp_file_path in preprocessor.temp_files_paths:
+                Path(temp_file_path).unlink(missing_ok=True)
             text = Path(pp_output).read_text(encoding="utf-8")
         ast = parser.parse(text, debug=0)
     except Exception:
