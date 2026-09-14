@@ -11,6 +11,16 @@ asserting the resolved base-checkpoint hash and max_steps match whatever
 M0 recorded, whenever `sampler.type: curriculum` and an `assert_against`
 path is given (see configs/m1_curriculum.yaml).
 
+Resumable: every `save_steps` interval (and at completion) writes the LoRA
+adapter plus a `trainer_state.pt` (optimizer/scheduler/step/RNG state) into
+`checkpoint-N/`. Re-running the same command against a `run_name` that
+already has checkpoints picks up from the latest one instead of restarting
+-- required because a real M0 run (~36 GPU-hours on a T4) outlives a single
+Colab session. If `./artifacts_drive_ckpt` exists (the Drive-backed symlink
+notebooks/02_train.ipynb's bootstrap cell creates), every checkpoint is
+also mirrored there and synced back on startup, since local `artifacts/`
+lives on the Colab VM's ephemeral disk and does not survive a disconnect.
+
 Requires: torch, transformers, peft, bitsandbytes, accelerate. These are
 GPU-flow dependencies (Part 0/2 of the guide) and are intentionally not
 imported at module load time so the rest of the repo (data pipeline,
@@ -67,6 +77,101 @@ def resolve_run_dir(cfg: dict[str, Any]) -> Path:
     return run_dir
 
 
+def find_latest_checkpoint(run_dir: Path) -> tuple[Path, int] | None:
+    candidates = []
+    for p in run_dir.glob("checkpoint-*"):
+        if not p.is_dir():
+            continue
+        try:
+            step = int(p.name.split("-", 1)[1])
+        except ValueError:
+            continue
+        candidates.append((step, p))
+    if not candidates:
+        return None
+    step, path = max(candidates, key=lambda x: x[0])
+    return path, step
+
+
+def drive_mirror_dir(run_dir: Path) -> Path | None:
+    """See module docstring. Returns None (no-op everywhere else in this
+    file) when not running in a notebook that set this symlink up, e.g.
+    local/CI runs of a debug config."""
+    drive_root = Path("artifacts_drive_ckpt")
+    if not drive_root.exists():
+        return None
+    mirror = drive_root / run_dir.name
+    mirror.mkdir(parents=True, exist_ok=True)
+    return mirror
+
+
+def sync_from_drive(run_dir: Path, mirror: Path | None) -> None:
+    if mirror is None:
+        return
+    import shutil
+    for item in mirror.iterdir():
+        dest = run_dir / item.name
+        if item.is_dir():
+            if not dest.exists():
+                shutil.copytree(item, dest)
+        elif not dest.exists() or item.stat().st_mtime > dest.stat().st_mtime:
+            shutil.copy2(item, dest)
+
+
+def sync_to_drive(run_dir: Path, mirror: Path | None, name: str) -> None:
+    if mirror is None:
+        return
+    import shutil
+    src = run_dir / name
+    dest = mirror / name
+    if src.is_dir():
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src, dest)
+
+
+def rng_state_dict() -> dict[str, Any]:
+    import random
+    import torch
+
+    state = {"python_random": random.getstate(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def load_rng_state_dict(state: dict[str, Any]) -> None:
+    import random
+    import torch
+
+    random.setstate(state["python_random"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def save_checkpoint(
+    run_dir: Path, tag: str, model, optimizer, scheduler,
+    step: int, running_loss: float, sampler, elapsed_hours: float,
+    mirror: Path | None,
+) -> None:
+    import torch
+
+    ckpt_dir = run_dir / tag
+    model.save_pretrained(ckpt_dir)
+    state = {
+        "step": step,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "running_loss": running_loss,
+        "elapsed_hours": elapsed_hours,
+        "sampler_rng_state": sampler.rng.getstate() if hasattr(sampler, "rng") else None,
+        **rng_state_dict(),
+    }
+    torch.save(state, ckpt_dir / "trainer_state.pt")
+    sync_to_drive(run_dir, mirror, tag)
+
+
 def checkpoint_hash(model) -> str:
     """A cheap fingerprint of the base checkpoint (config + first-layer
     weight sample), used to assert M0 and M1 started from literally the
@@ -119,8 +224,8 @@ def load_base_model_and_tokenizer(cfg: dict[str, Any]):
     return model, tokenizer
 
 
-def attach_lora(model, cfg: dict[str, Any]):
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+def attach_lora(model, cfg: dict[str, Any], resume_adapter_path: Path | None = None):
+    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
     model = prepare_model_for_kbit_training(model)
     # Belt-and-suspenders: prepare_model_for_kbit_training is supposed to
@@ -135,6 +240,16 @@ def attach_lora(model, cfg: dict[str, Any]):
     # need). Calling this explicitly costs nothing if peft already did it.
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
+
+    if resume_adapter_path is not None:
+        # Load the trained adapter weights from the checkpoint rather than
+        # a fresh random LoRA init -- is_trainable=True or peft defaults to
+        # eval-mode adapters (frozen), which would silently turn "resume"
+        # into "resume as a no-op inference model".
+        model = PeftModel.from_pretrained(model, str(resume_adapter_path), is_trainable=True)
+        print(f"[sft] resumed LoRA adapter weights from {resume_adapter_path}")
+        return model
+
     lora_cfg = cfg["lora"]
     peft_config = LoraConfig(
         r=lora_cfg["r"],
@@ -160,16 +275,18 @@ def build_sampler(cfg: dict[str, Any], rows: list[dict[str, Any]], total_steps: 
 
     if sampler_cfg["type"] == "flat":
         import random
-        rng = random.Random(seed)
 
         class FlatSampler:
+            def __init__(self, seed: int):
+                self.rng = random.Random(seed)
+
             def sample(self, step: int):
-                return rng.choice(rows)
+                return self.rng.choice(rows)
 
             def realised_histogram(self):
                 return {}
 
-        return FlatSampler()
+        return FlatSampler(seed)
 
     if sampler_cfg["type"] == "curriculum":
         from src.train.curriculum import PhaseWeightedSampler
@@ -221,6 +338,18 @@ def train(cfg: dict[str, Any]) -> None:
     run_dir = resolve_run_dir(cfg)
     log_path = run_dir / "train_log.jsonl"
 
+    mirror = drive_mirror_dir(run_dir)
+    sync_from_drive(run_dir, mirror)
+
+    final_dir = run_dir / "final"
+    if final_dir.exists() and (run_dir / "run_meta.json").exists():
+        print(f"[sft] {run_dir} already has a completed run (final/ + run_meta.json) -- "
+              "nothing to resume. Delete the run directory to retrain from scratch.")
+        return
+
+    resume = find_latest_checkpoint(run_dir)
+    resume_path = resume[0] if resume else None
+
     import subprocess
     try:
         gpu_name = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10).stdout.strip()
@@ -229,7 +358,7 @@ def train(cfg: dict[str, Any]) -> None:
     print(f"[sft] GPU: {gpu_name}")
 
     model, tokenizer = load_base_model_and_tokenizer(cfg)
-    model = attach_lora(model, cfg)
+    model = attach_lora(model, cfg, resume_adapter_path=resume_path)
 
     rows = build_dataset_rows(cfg)
 
@@ -263,11 +392,28 @@ def train(cfg: dict[str, Any]) -> None:
     grad_accum = cfg["training"]["grad_accum_steps"]
     save_steps = cfg["training"].get("save_steps", 200)
 
+    start_step = 0
+    running_loss = 0.0
+    prior_elapsed_hours = 0.0
+
+    if resume_path is not None:
+        import torch
+        trainer_state = torch.load(resume_path / "trainer_state.pt", map_location="cpu")
+        optimizer.load_state_dict(trainer_state["optimizer"])
+        scheduler.load_state_dict(trainer_state["scheduler"])
+        running_loss = trainer_state["running_loss"]
+        prior_elapsed_hours = trainer_state.get("elapsed_hours", 0.0)
+        start_step = trainer_state["step"] + 1
+        load_rng_state_dict(trainer_state)
+        if trainer_state.get("sampler_rng_state") is not None and hasattr(sampler, "rng"):
+            sampler.rng.setstate(trainer_state["sampler_rng_state"])
+        print(f"[sft] resuming from step {trainer_state['step']}/{total_steps} "
+              f"(checkpoint {resume_path}), prior elapsed {prior_elapsed_hours:.2f} GPU-hours")
+
     model.train()
     start_time = time.monotonic()
-    running_loss = 0.0
 
-    for step in range(total_steps):
+    for step in range(start_step, total_steps):
         micro_losses = []
         for _ in range(grad_accum):
             batch_rows = [sampler.sample(step) for _ in range(per_device_bs)]
@@ -300,12 +446,18 @@ def train(cfg: dict[str, Any]) -> None:
         })
 
         if step > 0 and step % save_steps == 0:
-            model.save_pretrained(run_dir / f"checkpoint-{step}")
+            elapsed_hours = prior_elapsed_hours + (time.monotonic() - start_time) / 3600
+            save_checkpoint(
+                run_dir, f"checkpoint-{step}", model, optimizer, scheduler,
+                step, running_loss, sampler, elapsed_hours, mirror,
+            )
+            sync_to_drive(run_dir, mirror, "train_log.jsonl")
 
-    model.save_pretrained(run_dir / "final")
-    tokenizer.save_pretrained(run_dir / "final")
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    sync_to_drive(run_dir, mirror, "final")
 
-    total_hours = (time.monotonic() - start_time) / 3600
+    total_hours = prior_elapsed_hours + (time.monotonic() - start_time) / 3600
     meta = {
         "run_name": cfg["run_name"],
         "total_steps": total_steps,
@@ -317,6 +469,7 @@ def train(cfg: dict[str, Any]) -> None:
     }
     with open(run_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, default=str)
+    sync_to_drive(run_dir, mirror, "run_meta.json")
     print(f"[sft] done. {total_steps} steps in {total_hours:.2f} GPU-hours. Artifacts -> {run_dir}")
 
 
