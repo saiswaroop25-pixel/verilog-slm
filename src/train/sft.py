@@ -474,6 +474,16 @@ def train(cfg: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    # Piping this through `tee` (as the notebook does, to also persist a
+    # log file) makes Python switch stdout from line-buffered (its default
+    # when attached to a terminal) to full block buffering -- progress
+    # prints can then sit unflushed for hours of real, healthy training
+    # before enough output accumulates to appear at all, which reads
+    # exactly like a hang. Force line buffering regardless of what stdout
+    # is connected to.
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
