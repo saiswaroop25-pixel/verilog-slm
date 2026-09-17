@@ -1,0 +1,19 @@
+# Same run as m0_baseline.yaml -- only adds a wall-clock safety stop, since
+# Kaggle hard-kills a session at its 12h cap (unlike Colab, which just
+# disconnects) rather than letting the process exit on its own. Without
+# this, a kill mid-checkpoint-write can leave a truncated checkpoint-N/
+# that the next session's resume can't load.
+#
+# run_name is deliberately still "m0" -- this must resume the SAME run
+# directory as configs/m0_baseline.yaml, not start a separate one. Before
+# launching this on a fresh Kaggle session, copy the latest checkpoint-N/
+# from wherever the previous session's artifacts/m0/ ended up (Drive, a
+# downloaded copy, or a Kaggle Dataset from a prior session's Output) into
+# this session's artifacts/m0/ so find_latest_checkpoint() in sft.py picks
+# it up -- see the migration steps for the exact commands.
+#
+#   python -m src.train.sft --config configs/m0_baseline_kaggle.yaml
+extends: m0_baseline.yaml
+
+training:
+  max_wall_hours: 11.5   # Kaggle GPU sessions hard-cap at 12h; leaves ~30min margin

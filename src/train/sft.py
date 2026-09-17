@@ -391,6 +391,7 @@ def train(cfg: dict[str, Any]) -> None:
     per_device_bs = cfg["training"]["per_device_batch_size"]
     grad_accum = cfg["training"]["grad_accum_steps"]
     save_steps = cfg["training"].get("save_steps", 200)
+    max_wall_hours = cfg["training"].get("max_wall_hours")
 
     start_step = 0
     running_loss = 0.0
@@ -445,13 +446,25 @@ def train(cfg: dict[str, Any]) -> None:
             "gpu": gpu_name,
         })
 
-        if step > 0 and step % save_steps == 0:
-            elapsed_hours = prior_elapsed_hours + (time.monotonic() - start_time) / 3600
+        elapsed_hours = prior_elapsed_hours + (time.monotonic() - start_time) / 3600
+        # Some platforms (Kaggle: 12h/session hard cap) kill the process
+        # outright at a wall-clock limit rather than just disconnecting
+        # (Colab) -- if that lands mid-checkpoint-write, the next resume
+        # attempt finds a truncated checkpoint-N/. Self-stop with margin
+        # instead: save cleanly and exit before the platform does it for us.
+        over_wall_budget = max_wall_hours is not None and elapsed_hours >= max_wall_hours
+
+        if over_wall_budget or (step > 0 and step % save_steps == 0):
             save_checkpoint(
                 run_dir, f"checkpoint-{step}", model, optimizer, scheduler,
                 step, running_loss, sampler, elapsed_hours, mirror,
             )
             sync_to_drive(run_dir, mirror, "train_log.jsonl")
+
+        if over_wall_budget:
+            print(f"[sft] wall-clock budget ({max_wall_hours}h) reached at step "
+                  f"{step}/{total_steps} -- exiting cleanly for resume next session")
+            return
 
     model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
