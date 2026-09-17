@@ -380,6 +380,7 @@ def train(cfg: dict[str, Any]) -> None:
 
     sampler = build_sampler(cfg, rows, total_steps)
 
+    import torch
     from torch.optim import AdamW
     from transformers import get_cosine_schedule_with_warmup
 
@@ -392,6 +393,8 @@ def train(cfg: dict[str, Any]) -> None:
     grad_accum = cfg["training"]["grad_accum_steps"]
     save_steps = cfg["training"].get("save_steps", 200)
     max_wall_hours = cfg["training"].get("max_wall_hours")
+    max_grad_norm = cfg["training"].get("max_grad_norm", 1.0)
+    nan_skips = 0
 
     start_step = 0
     running_loss = 0.0
@@ -430,7 +433,21 @@ def train(cfg: dict[str, Any]) -> None:
             loss.backward()
             micro_losses.append(loss.item() * grad_accum)
 
-        optimizer.step()
+        # fp16 (forced on T4 -- no bf16 tensor cores, see base.yaml) has no
+        # loss-scaling here, and an unclipped gradient spike can push LoRA
+        # weights into fp16 overflow; every forward after that is NaN
+        # forever (NaN propagates through matmuls and never recovers on its
+        # own). Clip pre-emptively, and if a step's grad norm is already
+        # non-finite by the time we see it, skip the update entirely rather
+        # than applying a NaN step that permanently poisons the weights --
+        # clip_grad_norm_ cannot "fix" a NaN (its scale factor is NaN too).
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+        else:
+            nan_skips += 1
+            print(f"[sft] step {step}: non-finite grad norm ({float(grad_norm)}) -- "
+                  f"skipping optimizer step ({nan_skips} skipped so far)")
         scheduler.step()
         optimizer.zero_grad()
 
