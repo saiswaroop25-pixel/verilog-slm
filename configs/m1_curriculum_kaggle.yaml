@@ -6,8 +6,15 @@
 # clean one-variable ablation against the M0 that actually exists rather
 # than the originally-planned 2997-step one.
 #
+# lr is also overridden to match M0's actual run: base.yaml's 2.0e-4 was
+# never what M0 finished on -- persistent fp16 instability forced it down
+# to 1.0e-4 partway through (configs/m0_baseline_kaggle_recovery.yaml).
+# M0 and M1 must differ in exactly one thing (the sampler); inheriting
+# base.yaml's original lr here would silently make it two.
+#
 #   python -m src.train.sft --config configs/m1_curriculum_kaggle.yaml
 extends: m1_curriculum.yaml
 
 training:
   max_wall_hours: 11.5
+  lr: 1.0e-4
