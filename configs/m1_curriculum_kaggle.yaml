@@ -1,0 +1,13 @@
+# Same as configs/m1_curriculum.yaml, plus the Kaggle wall-clock safety
+# stop (see configs/m0_baseline_kaggle.yaml for why). total_steps is
+# inherited from artifacts/m0/run_meta.json via assert_against -- M0
+# finished early at 601 steps (T4 fp16 instability, see run_meta.json's
+# stopped_early_reason), so M1 trains for 601 steps too, keeping this a
+# clean one-variable ablation against the M0 that actually exists rather
+# than the originally-planned 2997-step one.
+#
+#   python -m src.train.sft --config configs/m1_curriculum_kaggle.yaml
+extends: m1_curriculum.yaml
+
+training:
+  max_wall_hours: 11.5
