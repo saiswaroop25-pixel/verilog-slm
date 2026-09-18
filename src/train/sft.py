@@ -151,7 +151,7 @@ def load_rng_state_dict(state: dict[str, Any]) -> None:
 
 
 def save_checkpoint(
-    run_dir: Path, tag: str, model, optimizer, scheduler,
+    run_dir: Path, tag: str, model, optimizer, scheduler, scaler,
     step: int, running_loss: float, sampler, elapsed_hours: float,
     mirror: Path | None,
 ) -> None:
@@ -163,6 +163,7 @@ def save_checkpoint(
         "step": step,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
         "running_loss": running_loss,
         "elapsed_hours": elapsed_hours,
         "sampler_rng_state": sampler.rng.getstate() if hasattr(sampler, "rng") else None,
@@ -248,18 +249,32 @@ def attach_lora(model, cfg: dict[str, Any], resume_adapter_path: Path | None = N
         # into "resume as a no-op inference model".
         model = PeftModel.from_pretrained(model, str(resume_adapter_path), is_trainable=True)
         print(f"[sft] resumed LoRA adapter weights from {resume_adapter_path}")
-        return model
+    else:
+        lora_cfg = cfg["lora"]
+        peft_config = LoraConfig(
+            r=lora_cfg["r"],
+            lora_alpha=lora_cfg["alpha"],
+            lora_dropout=lora_cfg["dropout"],
+            target_modules=lora_cfg["target_modules"],
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, peft_config)
 
-    lora_cfg = cfg["lora"]
-    peft_config = LoraConfig(
-        r=lora_cfg["r"],
-        lora_alpha=lora_cfg["alpha"],
-        lora_dropout=lora_cfg["dropout"],
-        target_modules=lora_cfg["target_modules"],
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    return get_peft_model(model, peft_config)
+    # Keep the (small) set of trainable LoRA params in fp32 regardless of
+    # the frozen 4-bit base's compute dtype. Two multi-hundred-step fp16
+    # training runs on T4 both independently drifted into a state where
+    # every forward pass produced NaN -- consistent with fp16-precision
+    # rounding error accumulating over hundreds of small optimizer updates
+    # applied directly to fp16-stored weights, not just isolated gradient
+    # spikes (which clipping already guards against separately). This is
+    # standard QLoRA practice and costs negligible memory since only the
+    # adapter matrices are affected, not the frozen base.
+    for p in model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+
+    return model
 
 
 def build_dataset_rows(cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -388,6 +403,16 @@ def train(cfg: dict[str, Any]) -> None:
     warmup_steps = int(total_steps * cfg["training"].get("warmup_ratio", 0.03))
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
+    # Dynamic loss scaling: fp16 (forced on T4 -- no bf16 tensor cores) has
+    # a much narrower representable range than fp32, and gradients can
+    # silently underflow to zero or overflow to inf without it. This is
+    # the standard, purpose-built fix -- rescales the loss before backward
+    # so gradients land in fp16's representable range, and automatically
+    # backs the scale off (skipping that step's update) whenever an
+    # inf/nan is detected, rather than us hand-rolling that detection.
+    use_amp = torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     seq_len = cfg["training"]["seq_len"]
     per_device_bs = cfg["training"]["per_device_batch_size"]
     grad_accum = cfg["training"]["grad_accum_steps"]
@@ -405,6 +430,8 @@ def train(cfg: dict[str, Any]) -> None:
         trainer_state = torch.load(resume_path / "trainer_state.pt", map_location="cpu")
         optimizer.load_state_dict(trainer_state["optimizer"])
         scheduler.load_state_dict(trainer_state["scheduler"])
+        if "scaler" in trainer_state:
+            scaler.load_state_dict(trainer_state["scaler"])
         # load_state_dict overwrites scheduler.base_lrs with whatever the
         # checkpoint recorded, silently undoing a deliberate LR change in
         # this run's config (e.g. lowering it to recover from fp16
@@ -434,22 +461,24 @@ def train(cfg: dict[str, Any]) -> None:
             ).to(model.device)
             labels = enc["input_ids"].clone()
             labels[enc["attention_mask"] == 0] = -100
-            out = model(**enc, labels=labels)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                out = model(**enc, labels=labels)
             # Gradients from every micro-batch in this step get summed via
             # repeated .backward() calls before the optimizer step -- a
             # single example whose forward pass produces a non-finite loss
-            # (a corpus-data issue, independent of weight magnitude or LR:
-            # confirmed by this reproducing at the identical step across
-            # different LRs, since sampler.rng resumes deterministically)
-            # would otherwise poison the entire accumulated gradient.
-            # Identify and skip just that example's contribution instead.
+            # (a corpus-data issue, independent of weight magnitude: this
+            # reproduced at the identical step across different LRs, since
+            # sampler.rng resumes deterministically) would otherwise poison
+            # the entire accumulated gradient. Identify and skip just that
+            # example's contribution instead -- GradScaler below handles
+            # the separate case of a fine loss whose gradient overflows.
             if not torch.isfinite(out.loss):
                 bad_ids = [r.get("id", "?") for r in batch_rows]
                 print(f"[sft] step {step}: non-finite loss from example(s) {bad_ids} -- "
                       f"excluding from this step's accumulated gradient")
                 continue
             loss = out.loss / grad_accum
-            loss.backward()
+            scaler.scale(loss).backward()
             micro_losses.append(loss.item() * grad_accum)
 
         if not micro_losses:
@@ -459,21 +488,16 @@ def train(cfg: dict[str, Any]) -> None:
             scheduler.step()
             continue
 
-        # fp16 (forced on T4 -- no bf16 tensor cores, see base.yaml) has no
-        # loss-scaling here, and an unclipped gradient spike can push LoRA
-        # weights into fp16 overflow; every forward after that is NaN
-        # forever (NaN propagates through matmuls and never recovers on its
-        # own). Clip pre-emptively, and if a step's grad norm is already
-        # non-finite by the time we see it, skip the update entirely rather
-        # than applying a NaN step that permanently poisons the weights --
-        # clip_grad_norm_ cannot "fix" a NaN (its scale factor is NaN too).
+        scale_before = scaler.get_scale()
+        scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        if torch.isfinite(grad_norm):
-            optimizer.step()
-        else:
+        scaler.step(optimizer)
+        scaler.update()
+        if scaler.get_scale() < scale_before:
             nan_skips += 1
-            print(f"[sft] step {step}: non-finite grad norm ({float(grad_norm)}) -- "
-                  f"skipping optimizer step ({nan_skips} skipped so far)")
+            print(f"[sft] step {step}: GradScaler detected inf/nan (grad norm {float(grad_norm)}), "
+                  f"skipped optimizer step and backed off scale to {scaler.get_scale():.0f} "
+                  f"({nan_skips} skipped so far)")
         scheduler.step()
         optimizer.zero_grad()
 
@@ -499,7 +523,7 @@ def train(cfg: dict[str, Any]) -> None:
 
         if over_wall_budget or (step > 0 and step % save_steps == 0):
             save_checkpoint(
-                run_dir, f"checkpoint-{step}", model, optimizer, scheduler,
+                run_dir, f"checkpoint-{step}", model, optimizer, scheduler, scaler,
                 step, running_loss, sampler, elapsed_hours, mirror,
             )
             sync_to_drive(run_dir, mirror, "train_log.jsonl")
