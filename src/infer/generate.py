@@ -47,8 +47,17 @@ def load_model_for_inference(adapter_path: str, base_model_name: str | None = No
     # padding instead of right after its real content, silently
     # corrupting that row's output. Must be left-padded for generation.
     tokenizer.padding_side = "left"
+    # Single GPU, not device_map="auto"'s multi-GPU pipeline split: that
+    # split cost training measurably (bs=2 across 2 T4s ran slower than
+    # bs=1 on one, see configs/m0_memcheck_bs2.yaml), and generation is
+    # far more exposed to it -- with KV-caching, producing each new token
+    # is a full forward pass that crosses the pipeline boundary once, so
+    # up to max_new_tokens crossings per sequence instead of training's
+    # one per batch. A 1.5B model in bf16 fits a single T4 comfortably
+    # for inference (no optimizer/gradient memory needed here).
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     base = AutoModelForCausalLM.from_pretrained(
-        base_model_name, device_map="auto", torch_dtype=torch.bfloat16,
+        base_model_name, device_map=device, torch_dtype=torch.bfloat16,
     )
     model = PeftModel.from_pretrained(base, adapter_dir)
     model.eval()
