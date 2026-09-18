@@ -439,6 +439,17 @@ def train(cfg: dict[str, Any]) -> None:
         # position) should come from the checkpoint, not its target LR.
         scheduler.base_lrs = [cfg["training"]["lr"] for _ in scheduler.base_lrs]
         running_loss = trainer_state["running_loss"]
+        if running_loss != running_loss:  # NaN check (NaN is the only value unequal to itself)
+            # The EMA (0.98*old + 0.02*new) never resets on resume -- once
+            # a single non-finite step_loss poisoned it, every later step
+            # multiplies that NaN forward forever, even after the weights
+            # and every subsequent step are actually fine (as independently
+            # confirmed by checking the saved adapter/optimizer tensors for
+            # non-finite values). It's a display statistic only, not used
+            # for any training decision, so just reset it.
+            print("[sft] resumed running_loss was NaN (an earlier non-finite step poisoned "
+                  "the EMA permanently) -- resetting it")
+            running_loss = 0.0
         prior_elapsed_hours = trainer_state.get("elapsed_hours", 0.0)
         start_step = trainer_state["step"] + 1
         load_rng_state_dict(trainer_state)
