@@ -435,9 +435,29 @@ def train(cfg: dict[str, Any]) -> None:
             labels = enc["input_ids"].clone()
             labels[enc["attention_mask"] == 0] = -100
             out = model(**enc, labels=labels)
+            # Gradients from every micro-batch in this step get summed via
+            # repeated .backward() calls before the optimizer step -- a
+            # single example whose forward pass produces a non-finite loss
+            # (a corpus-data issue, independent of weight magnitude or LR:
+            # confirmed by this reproducing at the identical step across
+            # different LRs, since sampler.rng resumes deterministically)
+            # would otherwise poison the entire accumulated gradient.
+            # Identify and skip just that example's contribution instead.
+            if not torch.isfinite(out.loss):
+                bad_ids = [r.get("id", "?") for r in batch_rows]
+                print(f"[sft] step {step}: non-finite loss from example(s) {bad_ids} -- "
+                      f"excluding from this step's accumulated gradient")
+                continue
             loss = out.loss / grad_accum
             loss.backward()
             micro_losses.append(loss.item() * grad_accum)
+
+        if not micro_losses:
+            print(f"[sft] step {step}: every micro-batch produced a non-finite loss -- "
+                  f"skipping this step entirely")
+            optimizer.zero_grad()
+            scheduler.step()
+            continue
 
         # fp16 (forced on T4 -- no bf16 tensor cores, see base.yaml) has no
         # loss-scaling here, and an unclipped gradient spike can push LoRA
