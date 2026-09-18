@@ -1,0 +1,29 @@
+# Recovery config after a second fp16 instability event: gradient clipping
+# (max_grad_norm=1.0) contained the *symptom* around step 450 (no more
+# silent weight corruption -- see the non-finite-grad-norm skip in
+# sft.py), but it wasn't enough to prevent the instability recurring: by
+# step ~730 the model hit a stretch where every forward pass produced NaN
+# loss regardless of batch, meaning the weights themselves were already
+# broken and frozen there (every optimizer step was correctly skipped, but
+# skipping alone can't walk back OUT of a bad region either). No checkpoint
+# was lost -- save_steps=200 means the last real save was at step 600.
+#
+# This lowers training.lr from base.yaml's 2.0e-4 to 1.0e-4 for the rest of
+# the run. sft.py's resume logic now forces the scheduler's base LR from
+# THIS config rather than the checkpoint's saved value, so the change
+# actually takes effect on resume (see the scheduler.base_lrs override in
+# train()) -- only the cosine schedule's *position* (which step of the
+# curve we're on) is restored from the checkpoint, not its target LR.
+#
+# NOTE for the writeup: this is a deliberate deviation from M0's original
+# hyperparameters (Part 1 says M0 should be "nothing clever" / unmodified
+# baseline). Worth documenting as a limitations/methodology note: M0's LR
+# was reduced mid-run for numerical stability on T4 fp16, not for
+# performance reasons. M1 (configs/m1_curriculum.yaml) should use whatever
+# LR M0 actually finished with, to keep the ablation to one variable.
+#
+#   python -m src.train.sft --config configs/m0_baseline_kaggle_recovery.yaml
+extends: m0_baseline_kaggle.yaml
+
+training:
+  lr: 1.0e-4

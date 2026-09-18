@@ -405,6 +405,12 @@ def train(cfg: dict[str, Any]) -> None:
         trainer_state = torch.load(resume_path / "trainer_state.pt", map_location="cpu")
         optimizer.load_state_dict(trainer_state["optimizer"])
         scheduler.load_state_dict(trainer_state["scheduler"])
+        # load_state_dict overwrites scheduler.base_lrs with whatever the
+        # checkpoint recorded, silently undoing a deliberate LR change in
+        # this run's config (e.g. lowering it to recover from fp16
+        # instability) -- only the schedule's *progress* (warmup/cosine
+        # position) should come from the checkpoint, not its target LR.
+        scheduler.base_lrs = [cfg["training"]["lr"] for _ in scheduler.base_lrs]
         running_loss = trainer_state["running_loss"]
         prior_elapsed_hours = trainer_state.get("elapsed_hours", 0.0)
         start_step = trainer_state["step"] + 1
