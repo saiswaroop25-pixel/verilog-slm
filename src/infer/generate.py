@@ -106,7 +106,8 @@ def generate_batch(
 
 
 def run(adapter: str, split_path: str, split: str, n: int, temperature: float,
-        top_p: float, out_path: str, seed: int = 1337, limit: int | None = None) -> None:
+        top_p: float, out_path: str, seed: int = 1337, limit: int | None = None,
+        max_new_tokens: int = 768) -> None:
     set_seed(seed)
     rows = [r for r in read_jsonl(split_path) if r["split"] == split]
     if limit is not None and limit < len(rows):
@@ -119,7 +120,7 @@ def run(adapter: str, split_path: str, split: str, n: int, temperature: float,
     model, tokenizer = load_model_for_inference(adapter)
 
     prompts = [build_prompt(r["instruction"]) for r in rows]
-    completions = generate_batch(model, tokenizer, prompts, n, temperature, top_p)
+    completions = generate_batch(model, tokenizer, prompts, n, temperature, top_p, max_new_tokens)
 
     out_rows: list[dict[str, Any]] = []
     for row, comps in zip(rows, completions):
@@ -146,6 +147,12 @@ def main() -> None:
         help="cap the number of problems sampled from the split (random subsample, "
              "not a prefix) -- useful when the full split is too large to run in full",
     )
+    ap.add_argument(
+        "--max-new-tokens", type=int, default=768,
+        help="batched generate() only finishes a batch once every row in it stops, "
+             "so a handful of long/non-terminating completions can dominate wall-clock "
+             "time -- lower this for a faster (if more truncation-prone) pass",
+    )
     args = ap.parse_args()
 
     split_path = args.split_path
@@ -155,7 +162,7 @@ def main() -> None:
             split_path = yaml.safe_load(f)["data"]["corpus_path"]
 
     run(args.adapter, split_path, args.split, args.n, args.temperature, args.top_p,
-        args.out, args.seed, args.limit)
+        args.out, args.seed, args.limit, args.max_new_tokens)
 
 
 if __name__ == "__main__":
