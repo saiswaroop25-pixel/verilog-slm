@@ -40,6 +40,12 @@ def load_model_for_inference(adapter_path: str, base_model_name: str | None = No
     # otherwise silently blocks inference on an adapter with perfectly
     # good weights).
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    # Batched generate() on a decoder-only model advances every row in the
+    # batch from the same (padded) sequence length -- with right-padding,
+    # a shorter prompt's "next token" position lands inside its own
+    # padding instead of right after its real content, silently
+    # corrupting that row's output. Must be left-padded for generation.
+    tokenizer.padding_side = "left"
     base = AutoModelForCausalLM.from_pretrained(
         base_model_name, device_map="auto", torch_dtype=torch.bfloat16,
     )
