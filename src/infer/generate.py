@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -65,8 +66,10 @@ def generate_batch(
     expanded = [p for p in prompts for _ in range(n)]
 
     batch_size = 8
+    n_batches = (len(expanded) + batch_size - 1) // batch_size
     flat_outputs: list[str] = []
-    for i in range(0, len(expanded), batch_size):
+    start_time = time.monotonic()
+    for batch_idx, i in enumerate(range(0, len(expanded), batch_size)):
         chunk = expanded[i:i + batch_size]
         enc = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
         with torch.no_grad():
@@ -77,6 +80,16 @@ def generate_batch(
             )
         decoded = tokenizer.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
         flat_outputs.extend(decoded)
+
+        # No output at all until the very end otherwise -- this loop can
+        # run for hours (each batch does up to max_new_tokens sequential
+        # forward passes), and silence is indistinguishable from a hang.
+        elapsed = time.monotonic() - start_time
+        done = batch_idx + 1
+        avg = elapsed / done
+        eta_min = avg * (n_batches - done) / 60
+        print(f"[generate] batch {done}/{n_batches} ({elapsed/60:.1f}m elapsed, "
+              f"~{eta_min:.1f}m remaining)")
 
     for idx, text in enumerate(flat_outputs):
         all_outputs[idx // n].append(text)
