@@ -84,9 +84,16 @@ def generate_batch(
 
 
 def run(adapter: str, split_path: str, split: str, n: int, temperature: float,
-        top_p: float, out_path: str, seed: int = 1337) -> None:
+        top_p: float, out_path: str, seed: int = 1337, limit: int | None = None) -> None:
     set_seed(seed)
     rows = [r for r in read_jsonl(split_path) if r["split"] == split]
+    if limit is not None and limit < len(rows):
+        # A random subsample, not just the first `limit` rows -- corpus
+        # rows aren't shuffled by source/tier, so taking a prefix would
+        # bias the diagnostic table toward whichever dataset/tier happens
+        # to sort first instead of representing the full split.
+        import random
+        rows = random.Random(seed).sample(rows, limit)
     model, tokenizer = load_model_for_inference(adapter)
 
     prompts = [build_prompt(r["instruction"]) for r in rows]
@@ -112,6 +119,11 @@ def main() -> None:
     ap.add_argument("--top_p", type=float, default=0.95)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument(
+        "--limit", type=int, default=None,
+        help="cap the number of problems sampled from the split (random subsample, "
+             "not a prefix) -- useful when the full split is too large to run in full",
+    )
     args = ap.parse_args()
 
     split_path = args.split_path
@@ -120,7 +132,8 @@ def main() -> None:
         with open("configs/base.yaml", "r", encoding="utf-8") as f:
             split_path = yaml.safe_load(f)["data"]["corpus_path"]
 
-    run(args.adapter, split_path, args.split, args.n, args.temperature, args.top_p, args.out, args.seed)
+    run(args.adapter, split_path, args.split, args.n, args.temperature, args.top_p,
+        args.out, args.seed, args.limit)
 
 
 if __name__ == "__main__":
