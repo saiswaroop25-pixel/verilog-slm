@@ -6,6 +6,7 @@ from src.eval.metrics import (
     bootstrap_ci,
     catch_all_share,
     compute_pass_at_k_per_problem,
+    construct_failure_rate_table,
     pass_at_k,
     per_category_delta_table,
     repair_diagnostics,
@@ -63,6 +64,21 @@ def test_taxonomy_table_and_catch_all_share():
     from src.verify.taxonomy import CATCH_ALL_LABELS
     share = catch_all_share(table, CATCH_ALL_LABELS)
     assert abs(share - 2 / 3) < 1e-9
+
+
+def test_construct_failure_rate_table_keyed_by_construct_not_error_label():
+    results = [
+        {"ok": False, "error_label": "syntax_error", "constructs": ["case_stmt", "async_reset"]},
+        {"ok": True, "error_label": "none", "constructs": ["case_stmt"]},
+        {"ok": False, "error_label": "syntax_error", "constructs": ["bit_slicing"]},
+    ]
+    table = construct_failure_rate_table(results)
+    assert table["case_stmt"] == {"count": 2, "fail_rate": 0.5}
+    assert table["async_reset"] == {"count": 1, "fail_rate": 1.0}
+    assert table["bit_slicing"] == {"count": 1, "fail_rate": 1.0}
+    # None of these keys are error labels -- exactly the mismatch that made
+    # compute_reweighting silently no-op when fed taxonomy_table's output.
+    assert "syntax_error" not in table
 
 
 def test_per_category_delta_table():

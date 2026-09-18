@@ -24,7 +24,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from src.eval.metrics import catch_all_share, taxonomy_table
+from src.eval.metrics import catch_all_share, construct_failure_rate_table, taxonomy_table
 from src.infer.postprocess import finalize
 from src.utils.io_utils import read_jsonl
 from src.verify.taxonomy import CATCH_ALL_LABELS
@@ -32,9 +32,12 @@ from src.verify.taxonomy import CATCH_ALL_LABELS
 
 def _verify_one(args: tuple) -> dict[str, Any]:
     from src.verify.harness import verify_static
-    code, tier = args
+    code, tier, constructs = args
     result = verify_static(code, top_module="top")
-    return {"stage": result.stage, "ok": result.ok, "error_label": result.error_label, "tier": tier}
+    return {
+        "stage": result.stage, "ok": result.ok, "error_label": result.error_label,
+        "tier": tier, "constructs": constructs,
+    }
 
 
 def run(gens_path: str, out_path: str) -> None:
@@ -43,18 +46,25 @@ def run(gens_path: str, out_path: str) -> None:
     verify_args = []
     for row in rows:
         tier = row["tags"]["tier"]
+        constructs = row["tags"].get("constructs", [])
         for sample in row["samples"]:
-            verify_args.append((finalize(sample), tier))
+            verify_args.append((finalize(sample), tier, constructs))
 
     with ProcessPoolExecutor() as pool:
         results = list(pool.map(_verify_one, verify_args))
 
     table = taxonomy_table(results)
+    construct_rates = construct_failure_rate_table(results)
     report = {
         "n_problems": len(rows),
         "n_generations": len(results),
         "labels": table,
         "catch_all_share": catch_all_share(table, CATCH_ALL_LABELS),
+        # Keyed by construct tag, not error label -- this is what
+        # train/curriculum.py's compute_reweighting() actually consumes
+        # for M1 (see construct_failure_rate_table's docstring for why
+        # `labels` above can't be used for that directly).
+        "construct_failure_rates": construct_rates,
     }
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +77,9 @@ def run(gens_path: str, out_path: str) -> None:
         print("[diagnose] WARNING: catch-all share exceeds 60% -- the taxonomy is not "
               "discriminating well; see Part 13's row on this before building the "
               "curriculum on top of it.")
+    top_constructs = list(construct_rates.items())[:5]
+    print("[diagnose] highest-failure-rate constructs: " +
+          ", ".join(f"{tag}={v['fail_rate']:.0%} (n={v['count']})" for tag, v in top_constructs))
     print(f"[diagnose] wrote -> {out_path}")
 
 

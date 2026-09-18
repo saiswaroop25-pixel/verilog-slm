@@ -112,6 +112,34 @@ def taxonomy_table(verify_results: list[dict[str, Any]]) -> list[dict[str, Any]]
     return table
 
 
+def construct_failure_rate_table(verify_results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per-construct-tag failure rate: of all generations whose corpus row
+    carries a given construct tag (e.g. 'case_stmt', 'async_reset' --
+    src/verify/taxonomy.py's CONSTRUCT_TAGS), what share failed
+    verify_static()/verify()? Requires each record to also carry
+    'constructs' (the corpus row's construct tag list).
+
+    This -- not taxonomy_table()'s error-LABEL breakdown -- is what
+    train/curriculum.py's compute_reweighting() needs: a score keyed by
+    construct tag, since the curriculum oversamples examples by which
+    constructs they exercise, not by which way generations on them failed.
+    Error labels (e.g. 'syntax_error') and construct tags are disjoint
+    name spaces; feeding taxonomy_table()'s labels into compute_reweighting
+    silently produces uniform weights, since none of its lookups ever hit.
+    """
+    totals: dict[str, int] = defaultdict(int)
+    fails: dict[str, int] = defaultdict(int)
+    for r in verify_results:
+        for tag in r.get("constructs", []):
+            totals[tag] += 1
+            if not r["ok"]:
+                fails[tag] += 1
+    return {
+        tag: {"count": totals[tag], "fail_rate": fails[tag] / totals[tag]}
+        for tag in sorted(totals, key=lambda t: -fails[t] / totals[t])
+    }
+
+
 def catch_all_share(table: list[dict[str, Any]], catch_all_labels: set[str]) -> float:
     total = sum(row["count"] for row in table)
     catch_all = sum(row["count"] for row in table if row["label"] in catch_all_labels)

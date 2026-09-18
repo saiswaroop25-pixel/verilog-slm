@@ -296,7 +296,14 @@ def build_sampler(cfg: dict[str, Any], rows: list[dict[str, Any]], total_steps: 
         if diag_path and Path(diag_path).exists():
             with open(diag_path, "r", encoding="utf-8") as f:
                 diag = json.load(f)
-            failure_share = {row["label"]: row["share_of_failures"] for row in diag["labels"]}
+            # Keyed by construct tag (from construct_failure_rate_table in
+            # src/eval/metrics.py), not by error label ("labels" above) --
+            # compute_reweighting looks up each row's construct tags, and
+            # error-label keys never match those, which used to make this
+            # silently produce uniform weights regardless of the table.
+            failure_share = {
+                tag: v["fail_rate"] for tag, v in diag.get("construct_failure_rates", {}).items()
+            }
             from src.train.curriculum import compute_reweighting
             weights = compute_reweighting(rows, failure_share)
 
