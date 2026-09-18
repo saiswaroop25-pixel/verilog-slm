@@ -33,7 +33,13 @@ def load_model_for_inference(adapter_path: str, base_model_name: str | None = No
         with open(cfg_path, "r", encoding="utf-8") as f:
             base_model_name = json.load(f)["base_model_name_or_path"]
 
-    tokenizer = AutoTokenizer.from_pretrained(adapter_dir)
+    # From the base model, not adapter_dir: LoRA fine-tuning never touches
+    # the tokenizer, so a saved-adapter copy is never anything other than
+    # a duplicate of the base's -- and only ever a liability (a corrupted
+    # or truncated tokenizer.json in a saved checkpoint, seen in practice,
+    # otherwise silently blocks inference on an adapter with perfectly
+    # good weights).
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     base = AutoModelForCausalLM.from_pretrained(
         base_model_name, device_map="auto", torch_dtype=torch.bfloat16,
     )
