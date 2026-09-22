@@ -25,8 +25,9 @@ from src.utils.seeding import set_seed
 
 def load_model_for_inference(adapter_path: str, base_model_name: str | None = None):
     import torch
+    import yaml
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     adapter_dir = Path(adapter_path)
     if base_model_name is None:
@@ -47,17 +48,43 @@ def load_model_for_inference(adapter_path: str, base_model_name: str | None = No
     # padding instead of right after its real content, silently
     # corrupting that row's output. Must be left-padded for generation.
     tokenizer.padding_side = "left"
+
+    # Load the base model exactly the way sft.py trained against it --
+    # same configs/base.yaml quantization.* block, the single source of
+    # truth for both train and inference. This used to load full-precision
+    # bf16 instead ("cleaner inference"), which was wrong: a LoRA delta
+    # learned during training implicitly compensates for the specific
+    # numerical error 4-bit NF4 quantization introduces into the base
+    # weights it was trained against. Apply that same delta to a
+    # full-precision, differently-typed base instead and the mismatch
+    # doesn't just lose some quality -- confirmed in practice, it produces
+    # completely degenerate output (one token repeated for the entire
+    # generation), on an adapter whose weights were otherwise verified
+    # totally normal (finite, small magnitude).
+    with open("configs/base.yaml", "r", encoding="utf-8") as f:
+        base_cfg = yaml.safe_load(f)
+    quant = base_cfg.get("quantization", {})
+    bnb_config = None
+    compute_dtype = torch.bfloat16
+    if quant.get("load_in_4bit"):
+        compute_dtype = getattr(torch, quant.get("bnb_4bit_compute_dtype", "float16"))
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=quant.get("bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=quant.get("bnb_4bit_use_double_quant", True),
+        )
+
     # Single GPU, not device_map="auto"'s multi-GPU pipeline split: that
     # split cost training measurably (bs=2 across 2 T4s ran slower than
     # bs=1 on one, see configs/m0_memcheck_bs2.yaml), and generation is
     # far more exposed to it -- with KV-caching, producing each new token
     # is a full forward pass that crosses the pipeline boundary once, so
     # up to max_new_tokens crossings per sequence instead of training's
-    # one per batch. A 1.5B model in bf16 fits a single T4 comfortably
-    # for inference (no optimizer/gradient memory needed here).
+    # one per batch.
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     base = AutoModelForCausalLM.from_pretrained(
-        base_model_name, device_map=device, torch_dtype=torch.bfloat16,
+        base_model_name, quantization_config=bnb_config, device_map=device, torch_dtype=compute_dtype,
     )
     model = PeftModel.from_pretrained(base, adapter_dir)
     model.eval()
