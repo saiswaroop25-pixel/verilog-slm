@@ -1,0 +1,30 @@
+# A genuinely FRESH M0 retrain, not a resume of the original broken run.
+#
+# The original M0 (checkpoint-200/400/600, finalized at step 601) is
+# unusable: its training loss climbed to 3.5+ well before it ever went
+# NaN, and sat at 4.6 (vs. M1's 0.9) at finalization -- a real training-
+# quality failure, confirmed independent of the generate.py quantization
+# bug (that bug only affected how the already-bad model was evaluated
+# afterward, not how it was trained; sft.py's own model loading was
+# always correctly quantized). Resuming from any of those checkpoints
+# would just continue training a model that was already going wrong.
+#
+# Same run_name ("m0") as the original, since the rest of the pipeline
+# (M1's assert_against, diagnose.py, eval) hardcodes artifacts/m0/ --
+# but this MUST be launched against an empty artifacts/m0/ directory, or
+# sft.py's resume logic will pick the old checkpoint-600 back up. Before
+# running this: do NOT attach the old verilog-slm-ckpt dataset (or if you
+# do for corpus/data reasons, delete any restored artifacts/m0/checkpoint-*
+# first) so this starts a fresh LoRA init instead of resuming.
+#
+# lr is 1e-4 from step 0 (not base.yaml's 2e-4, and not a mid-run drop
+# like the original) -- this is exactly what M1 trained at, successfully,
+# with zero NaN events across all 601 steps. Same max_wall_hours guard,
+# same gradient clipping / non-finite skip / per-example exclusion
+# already in sft.py from the earlier debugging.
+#
+#   python -m src.train.sft --config configs/m0_retrain_kaggle.yaml
+extends: m0_baseline_kaggle.yaml
+
+training:
+  lr: 1.0e-4
