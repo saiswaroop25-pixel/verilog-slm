@@ -57,7 +57,7 @@ tests/            pure-Python unit tests (no GPU/iverilog required)
 
 ```bash
 pip install -r requirements.txt
-pytest -q          # 48 tests, no external tools required
+pytest -q          # 51 tests, no external tools required
 ```
 
 Building the corpus, training, and evaluation all need real RTL/data
@@ -78,6 +78,21 @@ python -m src.eval.run_eval --m0-adapter artifacts/m0/final --m1-adapter artifac
     --eval-sets data/eval/verilogeval_v2.jsonl data/eval/rtllm_v2.jsonl \
     --n 20 --k-repair 3 --seeds 1337 2025 7 --out artifacts/eval_report.json
 ```
+
+## Using a trained model directly
+
+Once a model is trained, ask it a single question rather than running the
+batch-oriented diagnostic/eval tooling:
+
+```bash
+python -m scripts.ask --adapter artifacts/m1/final \
+    --question "4-bit synchronous up counter with active-low reset"
+```
+
+For a live web page instead of the CLI, `notebooks/06_ask_kaggle.ipynb`
+loads a trained adapter once in a Kaggle session and serves a small Gradio
+app (a public link, live only while that session runs) wired to the same
+generation path.
 
 ## Non-negotiable invariants (enforced in code, not just docs)
 
