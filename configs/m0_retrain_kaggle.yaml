@@ -23,8 +23,17 @@
 # same gradient clipping / non-finite skip / per-example exclusion
 # already in sft.py from the earlier debugging.
 #
+# max_steps is capped at 601, matching the (also-retrained) M1's target --
+# without this cap, sft.py falls back to computing total_steps from 3
+# epochs over the full corpus (2997 steps, ~35 GPU-hours, several Kaggle
+# sessions/weeks of quota). 601 (~7 GPU-hours) is a deliberate choice to
+# keep this retrain within a similar budget to what's already been spent,
+# not a technical requirement -- raise or remove this cap if more GPU-hour
+# budget becomes available later and a stronger baseline is wanted.
+#
 #   python -m src.train.sft --config configs/m0_retrain_kaggle.yaml
 extends: m0_baseline_kaggle.yaml
 
 training:
   lr: 1.0e-4
+  max_steps: 601
