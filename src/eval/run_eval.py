@@ -56,11 +56,13 @@ def _verify_one(args: tuple) -> dict[str, Any]:
     }
 
 
-def run_no_repair_cell(model, tokenizer, eval_rows: list[dict[str, Any]], n: int) -> list[dict[str, Any]]:
+def run_no_repair_cell(model, tokenizer, eval_rows: list[dict[str, Any]], n: int,
+                        max_new_tokens: int = 768) -> list[dict[str, Any]]:
     from src.utils.prompts import build_prompt
 
     prompts = [build_prompt(r["instruction"]) for r in eval_rows]
-    completions = generate_batch(model, tokenizer, prompts, n=n, temperature=0.8, top_p=0.95)
+    completions = generate_batch(model, tokenizer, prompts, n=n, temperature=0.8, top_p=0.95,
+                                  max_new_tokens=max_new_tokens)
 
     verify_args = []
     problem_index = []
@@ -78,10 +80,19 @@ def run_no_repair_cell(model, tokenizer, eval_rows: list[dict[str, Any]], n: int
     return results
 
 
-def run_repair_cell(model, tokenizer, eval_rows: list[dict[str, Any]], k_repair: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    gen_fn = make_hf_generate_fn(model, tokenizer)
+def run_repair_cell(model, tokenizer, eval_rows: list[dict[str, Any]], k_repair: int,
+                     max_new_tokens: int = 768) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    import time
+
+    # Unlike run_no_repair_cell, this isn't batched -- each repair attempt
+    # depends on the previous one's error, so problems are processed one
+    # at a time, each up to K+1 sequential generate() calls. No progress
+    # output otherwise made this indistinguishable from a hang for
+    # anything but a handful of problems.
+    gen_fn = make_hf_generate_fn(model, tokenizer, max_new_tokens=max_new_tokens)
     verify_results, traces = [], []
-    for row in eval_rows:
+    start_time = time.monotonic()
+    for i, row in enumerate(eval_rows):
         code, ok, trace = generate_with_repair(
             gen_fn, row["instruction"], row["testbench"],
             top_module=row.get("top_module", "top"), K=k_repair,
@@ -92,6 +103,12 @@ def run_repair_cell(model, tokenizer, eval_rows: list[dict[str, Any]], k_repair:
             "tier": row["tier"], "problem_id": row["id"],
         })
         traces.append({"attempts": trace.attempts, "regressions": trace.regressions, "problem_id": row["id"]})
+
+        elapsed = time.monotonic() - start_time
+        done = i + 1
+        eta_min = (elapsed / done) * (len(eval_rows) - done) / 60
+        print(f"[run_eval] repair problem {done}/{len(eval_rows)} "
+              f"({len(trace.attempts)} attempts, {elapsed/60:.1f}m elapsed, ~{eta_min:.1f}m remaining)")
     return verify_results, traces
 
 
@@ -112,15 +129,19 @@ def summarise_cell(verify_results: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def run_2x2(m0_adapter: str, m1_adapter: str, eval_rows: list[dict[str, Any]], n: int, k_repair: int) -> dict[str, Any]:
+def run_2x2(m0_adapter: str, m1_adapter: str, eval_rows: list[dict[str, Any]], n: int, k_repair: int,
+            max_new_tokens: int = 768) -> dict[str, Any]:
     cells: dict[str, Any] = {}
     for model_key, adapter in [("M0", m0_adapter), ("M1", m1_adapter)]:
+        print(f"[run_eval] loading {model_key} ({adapter})...")
         model, tokenizer = load_model_for_inference(adapter)
 
-        no_repair = run_no_repair_cell(model, tokenizer, eval_rows, n)
+        print(f"[run_eval] {model_key}: repair-off cell ({len(eval_rows)} problems x {n} samples)...")
+        no_repair = run_no_repair_cell(model, tokenizer, eval_rows, n, max_new_tokens=max_new_tokens)
         cells[f"{model_key}_repair_off"] = summarise_cell(no_repair)
 
-        with_repair, traces = run_repair_cell(model, tokenizer, eval_rows, k_repair)
+        print(f"[run_eval] {model_key}: repair-on cell ({len(eval_rows)} problems, up to {k_repair} repairs each)...")
+        with_repair, traces = run_repair_cell(model, tokenizer, eval_rows, k_repair, max_new_tokens=max_new_tokens)
         cell = summarise_cell(with_repair)
         cell["repair_diagnostics"] = repair_diagnostics(traces)
         cell["budget"] = f"1 sample, up to {k_repair} repairs"
@@ -146,16 +167,27 @@ def run_2x2(m0_adapter: str, m1_adapter: str, eval_rows: list[dict[str, Any]], n
 
 def run_multi_seed(m0_adapter: str, m1_adapter: str, eval_paths: list[str], n: int,
                     k_repair: int, seeds: list[int], out_path: str,
-                    m0_gpu_hours: float | None = None, m1_gpu_hours: float | None = None) -> None:
+                    m0_gpu_hours: float | None = None, m1_gpu_hours: float | None = None,
+                    limit: int | None = None, max_new_tokens: int = 768) -> None:
     eval_rows: list[dict[str, Any]] = []
     for p in eval_paths:
         eval_rows.extend(read_jsonl(p))
+
+    total_available = len(eval_rows)
+    if limit is not None and limit < total_available:
+        # A fixed sampling seed (not one of the eval `seeds`) so the same
+        # subset of problems is used across every seed and every cell --
+        # only the generation randomness should vary per seed, not which
+        # problems get evaluated.
+        import random
+        eval_rows = random.Random(1337).sample(eval_rows, limit)
+        print(f"[run_eval] evaluating a random subsample of {limit} problems (out of {total_available})")
 
     per_seed_results = []
     for seed in seeds:
         set_seed(seed)
         print(f"[run_eval] seed={seed}")
-        per_seed_results.append(run_2x2(m0_adapter, m1_adapter, eval_rows, n, k_repair))
+        per_seed_results.append(run_2x2(m0_adapter, m1_adapter, eval_rows, n, k_repair, max_new_tokens=max_new_tokens))
 
     report = {
         "seeds": seeds, "n_eval_problems": len(eval_rows),
@@ -191,11 +223,25 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--m0-gpu-hours", type=float, default=None)
     ap.add_argument("--m1-gpu-hours", type=float, default=None)
+    ap.add_argument(
+        "--limit", type=int, default=None,
+        help="cap the number of eval problems (random subsample, same fixed seed "
+             "across --seeds so every seed evaluates the same problems) -- the full "
+             "combined eval sets can be a few hundred problems, and each one costs "
+             "n generations (repair-off) plus up to k_repair+1 more (repair-on), "
+             "per model, per seed",
+    )
+    ap.add_argument(
+        "--max-new-tokens", type=int, default=768,
+        help="passed through to both the repair-off (batched) and repair-on "
+             "(one-at-a-time) generation paths",
+    )
     args = ap.parse_args()
 
     run_multi_seed(
         args.m0_adapter, args.m1_adapter, args.eval_sets, args.n, args.k_repair,
         args.seeds, args.out, args.m0_gpu_hours, args.m1_gpu_hours,
+        args.limit, args.max_new_tokens,
     )
 
 
