@@ -11,9 +11,10 @@
         --out artifacts/eval_report.json
 
 Each eval-set row is expected to carry: id, instruction, testbench,
-top_module, tier (structural tier, for the taxonomy table), and code
-(reference solution, used only for corpus-contamination checks upstream --
-never used for scoring here; scoring is verification-gated).
+top_module, tags.tier (structural tier, for the taxonomy table -- nested
+under "tags", same as the corpus schema, not a flat "tier" field), and
+code (reference solution, used only for corpus-contamination checks
+upstream -- never used for scoring here; scoring is verification-gated).
 
 Runs simulation in a process pool (Part 4: simulation is CPU-bound and
 embarrassingly parallel -- run this cell on a CPU-only Colab runtime to
@@ -69,7 +70,7 @@ def run_no_repair_cell(model, tokenizer, eval_rows: list[dict[str, Any]], n: int
     for row, comps in zip(eval_rows, completions):
         for code in comps:
             from src.infer.postprocess import finalize
-            verify_args.append((finalize(code), row["testbench"], row.get("top_module", "top"), row["tier"]))
+            verify_args.append((finalize(code), row["testbench"], row.get("top_module", "top"), row["tags"]["tier"]))
             problem_index.append(row["id"])
 
     with ProcessPoolExecutor() as pool:
@@ -100,7 +101,7 @@ def run_repair_cell(model, tokenizer, eval_rows: list[dict[str, Any]], k_repair:
         last = trace.attempts[-1]
         verify_results.append({
             "stage": last["stage"], "ok": ok, "error_label": last["label"],
-            "tier": row["tier"], "problem_id": row["id"],
+            "tier": row["tags"]["tier"], "problem_id": row["id"],
         })
         traces.append({"attempts": trace.attempts, "regressions": trace.regressions, "problem_id": row["id"]})
 
