@@ -45,11 +45,18 @@ separates the effect of the curriculum from the effect of repair.
 *exactly one thing*: how training examples are sampled. Same base model,
 same learning rate, same number of steps, same seed.
 
-**Where we are.** M0 is trained but stopped early (601 of a planned 2997
-steps) because of numerical instability on the T4 GPUs. We moved from Colab
-to Kaggle when Colab's GPU quota ran out. We built the diagnostic pass,
-found and fixed a silent bug that made M1's error-driven reweighting do
-nothing, and were about to start M1.
+**Where we are.** Both M0 and M1 are trained (601 of a planned 2997 steps
+each, by deliberate budget choice, not instability -- see Section 5) and the
+first real 2x2 evaluation has run. The headline result: at this training
+budget, M0 and M1 perform identically (pass@1 = pass@5, exactly, curriculum
+effect = 0.0000), and the repair loop was neutral-to-harmful for both. This
+is a genuine, defensible null result, not a broken pipeline -- Section 6 has
+the full numbers and Section 9 has suggested write-up language. Getting here
+took: moving from Colab to Kaggle, a long fp16-instability debugging saga,
+a silent curriculum-reweighting bug, a silent inference-quantization bug
+that invalidated every generation before it was found, and losing (then
+redoing) one full M0 training run to a failed save. All of it is in
+Section 5, in order, with the reasoning at each step.
 
 ---
 
@@ -312,19 +319,53 @@ flowchart TD
 
 *Fig. 8. Each "Fix" addressed a real defect found by evidence, but none removed the underlying fp16 instability. Fix 4 made things worse and was reverted on evidence. The run was finalized at the last verified-clean checkpoint.*
 
+**Epilogue to this figure:** the 601-step finalized run above was later judged
+unusable on different grounds -- its loss had climbed to 3.5+ well before any
+NaN and finished at 4.6, a genuine training-quality failure, separate from
+the instability fight itself (Section 5.9). M0 was retrained from scratch at
+`lr=1e-4` from step 0 (not a resume), deliberately capped at 601 steps to
+match the budget already spent on M1, and that retrain reproduced a healthy
+loss curve (0.43 to 0.80) with zero non-finite events across all 601 steps.
+It was then lost when a Kaggle session ended before the weights were
+downloaded (Quick Save had silently captured nothing), and had to be
+retrained a second time under a separate Kaggle account for a fresh quota --
+that second retrain reproduced the *same* loss curve almost exactly (fixed
+seed, deterministic pipeline), which is itself a small reassuring
+confirmation that the result is real and repeatable, not a fluke.
+
 ### Figure 9. Roadmap and status
 
 ```mermaid
 flowchart LR
-  D1["Data pipeline<br/>DONE"] --> D2["M0 training<br/>DONE, stopped at 601/2997"]
-  D2 --> D3["Diagnostic pass<br/>DONE, 100 problems x 5"]
+  D1["Data pipeline<br/>DONE"] --> D2["M0 training<br/>DONE, 601/2997 by choice<br/>(lost once, retrained)"]
+  D2 --> D3["Diagnostic pass<br/>DONE, corrected after<br/>the quantization bug fix"]
   D3 --> D4["Reweighting bug fix<br/>DONE"]
-  D4 --> D5["M1 training<br/>NEXT, about 7 hours"]
-  D5 --> D6["Eval 2x2<br/>NOT STARTED, notebook 04 not ported to Kaggle"]
-  D6 --> D7["Write-up"]
+  D4 --> D5["M1 training<br/>DONE, matches M0 exactly"]
+  D5 --> D6["Quantization bug found + fixed<br/>DONE -- see 5.10"]
+  D6 --> D7["Eval 2x2<br/>DONE, n=30, 1 seed<br/>null result -- see Section 6"]
+  D7 --> D8["Write-up"]
 ```
 
 *Fig. 9. Status at the time of writing.*
+
+### Figure 10. Eval result summary (30 problems, n=5, seed 1337)
+
+```mermaid
+flowchart TD
+  subgraph OFF["Repair off"]
+    A["M0: pass@1 3.3%<br/>pass@5 13.3%<br/>syntax_error 92.0%"]
+    C["M1: pass@1 3.3%<br/>pass@5 13.3%<br/>syntax_error 95.3%"]
+  end
+  subgraph ON["Repair on (K=3)"]
+    B["M0: pass@1 0.0%<br/>0/30 resolved"]
+    D["M1: pass@1 3.3%<br/>1/30 resolved"]
+  end
+  A -->|"curriculum effect = 0.0000"| C
+  A -->|"repair effect = -0.033<br/>(repair hurt M0)"| B
+  C -->|"repair effect = 0.000<br/>(repair neutral for M1)"| D
+```
+
+*Fig. 10. `pass@5` for the repair-on cells is a mathematical artifact (only 1 sample per problem there, and the unbiased estimator returns exactly 1.0 whenever fewer samples exist than k) -- not a real number, omitted here. The honest read: no detectable curriculum effect, and the repair loop did not help either model at this competence level.*
 
 ---
 
@@ -368,7 +409,10 @@ batch 1 x 32 accumulation, cosine schedule with 3% warmup, seed 1337.
 ### 4.5 Inference and repair (`src/infer/`)
 `generate.py` does batched sampling from a trained adapter. `repair.py` is the
 bounded loop of Figure 6. `postprocess.py` strips markdown fences, keeps only
-the module, and formats with verible.
+the module, and formats with verible. Inference loads the base model with the
+**same 4-bit NF4 quantization config training used** (`configs/base.yaml`'s
+`quantization` block) -- this was not always true (Section 5.10) and getting
+it wrong doesn't just cost some quality, it produces fully degenerate output.
 
 ### 4.6 Evaluation (`src/eval/`)
 `diagnose.py` builds the failure tables from probe-split generations.
@@ -509,6 +553,139 @@ would have differed from M0 in two ways (sampler and learning rate), breaking
 the one-variable rule. `configs/m1_curriculum_kaggle.yaml` now sets
 `lr: 1.0e-4`.
 
+### 5.8 M1 trained cleanly; M0's first retrain was lost
+M1 trained the full 601 steps at `lr=1e-4` with **zero** non-finite events --
+a clean run, unlike everything M0 had been through. Verified: adapter
+weights all finite (max |w| 0.056), `checkpoint_hash` matches M0's exactly,
+`diagnostic_table_path` confirms it used the (already-fixed) construct-keyed
+reweighting table.
+
+Given M1's clean run, the original 601-step M0 (finalized early due to
+instability, Section 5.3) was judged not good enough to compare against
+fairly -- so M0 was **retrained from scratch**, fresh LoRA init (not a
+resume of the broken run), same `lr=1e-4`, deliberately capped at 601 steps
+via a new `training.max_steps` to match M1's already-spent budget rather
+than commit to the full 2997-step, ~35 GPU-hour run. `configs/
+m0_retrain_kaggle.yaml` encodes this, with an explicit warning not to attach
+the old checkpoint dataset (attaching it would silently resume the broken
+run instead of starting fresh).
+
+That first retrain finished cleanly (loss 1.47 to 0.43 to 0.80, zero
+non-finite events, 6.83 GPU-hours) -- and was then **lost**. The Kaggle
+session ended before the model weights were downloaded; three separate
+Quick Saves of that notebook all came up with an empty Output (a real
+Kaggle quirk, not a mistake in the steps taken). Only three small files
+survived, downloaded directly from the live session's file browser just
+before it died: `run_meta.json`, `m0_diagnostic.json`, `train_log.jsonl`.
+The actual weights (`adapter_model.safetensors`) were gone.
+
+### 5.9 The generation-quantization bug
+Before retraining M0 a second time, the corrected diagnostic pass on the
+(soon to be lost) first retrain still showed persistently high failure
+rates -- every construct tag at 100% failure, 81.4% of failures still
+`syntax_error` -- which didn't fit a training run with a healthy loss curve.
+A direct side-by-side generation test (base model alone, vs. M1's adapter
+attached, vs. M1's adapter *merged* into the weights) isolated it:
+
+- The raw base model, no adapter, generated correct, coherent text --
+  twice, independently. The shared generation code was not the bug.
+- M1's adapter attached to the full-precision (`bfloat16`, unquantized)
+  base -- both as a live PEFT wrapper *and* fully merged into the weights --
+  produced degenerate output: a single repeated character for the entire
+  200-token generation. Merging rules out a PEFT/caching bug (a merged
+  model is just a plain model with the adapter's numbers baked in).
+- Loading the base model **quantized the same way training did** (4-bit
+  NF4, float16 compute -- `configs/base.yaml`'s own `quantization` block)
+  and attaching the same adapter produced real, structured Verilog
+  immediately: `module bin2dec(...); always @ * begin ... end endmodule`.
+
+Root cause: a LoRA delta learned during training implicitly compensates for
+the specific numerical error 4-bit NF4 quantization introduces into the base
+weights it was trained against. `generate.py` had been loading the base
+model at full precision "for cleaner inference quality" -- which is exactly
+backwards for a QLoRA adapter. Every prior generation run in this project
+(the very first M0 diagnostic pass, and everything downstream of it) was
+against this broken path. Fixed in `src/infer/generate.py`'s
+`load_model_for_inference()`: read `configs/base.yaml`'s quantization
+settings directly, the same source of truth `sft.py` trains against.
+
+Testing the same fix against the (about-to-be-lost) M0 retrain's adapter
+showed it did **not** recover the same way M1 did -- confirming M0's
+problem was in training itself, not just how it was being read afterward,
+which is exactly what its loss curve (climbing to 3.5+ before ever going
+NaN in the very first Colab attempt) had already suggested.
+
+### 5.10 M0's second retrain, done carefully
+Retrained a second time, under a separate Kaggle account (for a fresh
+weekly quota, since the first account's was largely spent). Same config,
+same fixed seed -- reproduced the *same* loss curve as the lost first
+retrain almost exactly (1.4678 to 0.4282 to ... to 0.7974), which is a
+useful confirmation that this is a real, repeatable result and not a
+fluke. This time, `artifacts/m0/final/` was downloaded directly from the
+live session **immediately** on completion, before Quick Save, before
+anything else -- verified finite (max |w| 0.055) and uploaded as its own
+dataset before the session could be closed.
+
+### 5.11 Sizing and fixing `run_eval.py` for Kaggle
+The original 2x2 spec (n=20 samples, k_repair=3, 3 seeds, the full combined
+eval sets -- 206 problems) would take many hours to days at this project's
+measured throughput, and the repair-on path had **zero** progress output
+(unbatched -- one problem at a time, up to `k_repair+1` sequential
+`generate()` calls each -- indistinguishable from a hang for anything but a
+handful of problems). Added `--limit` (random subsample, fixed sampling
+seed independent of the eval seeds so every seed evaluates the same
+problems), `--max-new-tokens`, and per-problem progress+ETA to the
+repair-on path. Sized the Kaggle run at 30 problems, n=5, 1 seed
+(~1.5-2 hours) rather than the full multi-day spec.
+
+Running it immediately hit a second real, pre-existing bug: `KeyError:
+'tier'`. The eval-set schema (`scripts/build_eval_jsonl.py`) nests
+structural tier under `row["tags"]["tier"]` -- the same nesting the corpus
+schema uses, and the same nesting `diagnose.py` already reads correctly --
+but `run_eval.py` read `row["tier"]` directly in two places. This is the
+first real end-to-end eval run in the project's history, so it had never
+been exercised before. Fixed both call sites, added
+`tests/test_run_eval.py` (fakes generation and verification the same way
+`test_repair.py` already does, so this class of bug is now caught locally
+instead of only surfacing after real GPU-hours are spent on a run that
+can't finish).
+
+### 5.12 The actual eval result
+30 problems, n=5, seed 1337, both models, repair off and on:
+
+| Cell | pass@1 | pass@5 | syntax_error rate |
+|---|---|---|---|
+| M0, repair off | 3.3% | 13.3% | 92.0% |
+| M1, repair off | 3.3% | 13.3% | 95.3% |
+| M0, repair on (K=3) | 0.0% | n/a (see below) | 100% |
+| M1, repair on (K=3) | 3.3% | n/a (see below) | 90.0% |
+
+`curriculum_effect (M1 - M0, repair off) = 0.0000` -- exactly zero. At this
+training budget the two models are statistically indistinguishable on
+pass@1/pass@5. `repair_effect (M0) = -0.033` -- the repair loop made M0
+strictly worse, resolving 0 of 30 problems in up to 3 attempts each (full
+budget used every time, no success). `repair_effect (M1) = 0.000` -- neutral,
+resolving 1 of 30. Neither model's repair loop showed evidence of learning
+anything useful from the compiler's error text at this competence level.
+
+The per-category delta table adds one nuance worth reporting cautiously
+(small counts, single seed): M1 had a *lower* rate of the more "structural"
+mistakes (`undefined_module` 11.0% to 4.1%, `wrong_logic_other` 4.1% to
+1.4%, `port_mismatch` 2.1% to 0.7%) but a *higher* raw `syntax_error` rate
+(74.5% to 82.8%) than M0. A plausible read is that M1 is attempting more
+complete, structurally ambitious code and tripping on surface syntax more
+often, while M0 fails at a more basic level -- but with 1-3 occurrences
+behind most of these deltas, this shouldn't be leaned on hard without more
+samples.
+
+One methodological note worth keeping: **`pass@5` is not a meaningful
+number for the repair-on cells** and is omitted from the table above. The
+repair-on path generates exactly one sample per problem (one repair
+trajectory, not five independent draws), and the unbiased pass@k estimator
+mathematically returns exactly 1.0 whenever fewer samples exist than `k` --
+this showed up as both repair-on cells reporting "pass@5 = 100%", which is
+an estimator artifact, not a real result.
+
 ---
 
 ## 6. Current state and numbers
@@ -516,106 +693,128 @@ the one-variable rule. `configs/m1_curriculum_kaggle.yaml` now sets
 | Item | Value |
 |---|---|
 | Base model | Qwen2.5-Coder-1.5B-Instruct, 4-bit |
-| Planned M0 steps | 2997 (3 epochs, effective batch 32) |
-| Actual M0 steps | 601 (about 20%) |
-| M0 learning rate at finish | 1e-4 (started at 2e-4) |
-| M0 final checkpoint | step index 600, hash `49cef5cbe22469ba`, adapter max abs weight 0.094, all finite |
-| Recorded training time | about 7.04 GPU-hours |
-| Probe split size | 3553 rows (10%) |
-| Diagnostic sample | 100 problems x 5 = 500 generations |
-| Diagnostic outcome | 100% of failures are `syntax_error`; every construct tag has about 100% failure rate; tier share of failures T1 36%, T2 34%, T4 27%, T3 3% |
-| Catch-all label share | 0% |
-| Tests | 51 pass, 3 skipped |
-| Expected M1 time | about 601 x 42.3 s = 7 hours |
+| Planned steps (original design) | 2997 (3 epochs, effective batch 32) |
+| Actual steps, M0 and M1 | 601 each (deliberate budget cap, not instability) |
+| Learning rate | 1e-4 for both (matched, one-variable ablation preserved) |
+| Checkpoint hash | `49cef5cbe22469ba` -- identical for M0 and M1, confirms same base checkpoint |
+| M0 final loss / M1 final loss | 0.80 / 0.93 (not directly comparable -- different samplers see different difficulty mixes) |
+| Adapter weights | both verified finite; M0 max \|w\| 0.055, M1 max \|w\| 0.056 |
+| Training time | M0 6.83 GPU-h (second retrain), M1 7.8 GPU-h |
+| Eval sample | 30 problems (random subsample of 206), n=5, seed 1337 |
+| **pass@1, repair off** | **M0 3.3%, M1 3.3% -- curriculum effect = 0.0000** |
+| **pass@5, repair off** | **M0 13.3%, M1 13.3%** |
+| syntax_error rate, repair off | M0 92.0%, M1 95.3% |
+| **repair effect (pass@1)** | **M0 -3.3% (harmful), M1 0.0% (neutral)** |
+| repair-on resolution | M0 0/30 resolved, M1 1/30 resolved |
+| Tests | 53 pass, 3 skipped |
 
-Interpretation: at 601 steps M0 is failing almost uniformly, so it does not
-yet fail in construct-specific ways. That limits how much the error-driven
-reweighting can differ from uniform in M1 (Section 7, item 3).
+Interpretation: at 601 steps, both models are still near the floor and are
+statistically indistinguishable from each other on the headline metric. This
+is a real, reportable null result at this training budget -- not a failed
+pipeline. Full breakdown, including the per-category nuance, in Section 5.12.
 
 ---
 
 ## 7. Open issues and risks
 
-Read these before drawing conclusions from M0 or M1.
+Read these before extending or citing these results further.
 
-1. **Training text has no end-of-sequence token (verified), with a likely
-   effect on generation (not yet confirmed on real samples).**
-   `format_sft_example()` builds `prompt + "\n" + code`. We tokenized an
-   example with the Qwen tokenizer locally: it ends with the tokens of
-   `endmodule`, not with `<|im_end|>` (the EOS token, id 151645). So the model
-   is never shown where to stop, and it will tend to keep generating until the
-   token cap. Signs that fit: generation batch times were almost constant
-   (every batch seemed to run to the cap), and `extract_module()` keeps text
-   from the first `module ` to the *last* `endmodule`, so trailing junk that
-   contains another `endmodule` would corrupt the extracted code and produce
-   syntax errors. This could explain part or all of the 100% `syntax_error`
-   on the probe split. **How to confirm (cheap, no GPU):** print two or three
-   raw samples from `artifacts/m0_probe_gens.jsonl` and see whether they
-   continue past the first `endmodule` (repeated prompt text, extra modules).
-   Fix options: (a) stop generation at the first `endmodule` and truncate
-   there (no retraining; helps evaluation immediately, and can be applied
-   to M0 and M1 alike); (b) append `tokenizer.eos_token` to the training text
-   and retrain (correct long-term fix, but costs a new M0 and M1). Also note
-   that loss is currently computed over the prompt tokens as well as the code
-   (no prompt masking); this is a smaller issue but worth a line in the
-   write-up.
-2. **Unresolved fp16 instability on T4.** Guards contain it; the root cause is
-   unknown. M1 has the same exposure (601 steps, so smaller). Plan: same
-   playbook (check checkpoint for NaN, finalize early).
-3. **Weak diagnostic signal.** Near-uniform 100% failure gives the reweighting
-   little to work with; it mostly ranks rows by how many construct tags they
-   have. Tier phasing still differs from M0 and is unaffected. Report this
-   as a finding, not a hidden detail.
-4. **Broad construct regexes.** Tags like `blocking_assign` and `arithmetic`
-   match a large share of all code (n=265 and n=325 of 500), so they carry
-   little information even with a well-trained model.
-5. **Artifacts that live only in a session.** `m0_probe_gens.jsonl` and
-   `m0_diagnostic.json` are not in any Dataset yet. A stopped session loses
-   them (we already lost one session once). Upload them.
-6. **Bootstrap gaps.** It does not restore `run_meta.json`, `final/`, or
-   `m0_diagnostic.json` automatically; restore them by hand from the attached
-   Dataset (use `find /kaggle/input -iname ...` first, then `cp`).
-7. **Evaluation not started.** `notebooks/03_diagnose.ipynb` and
-   `04_eval.ipynb` exist only for Colab. Nothing has been evaluated on
-   VerilogEval or RTLLM yet.
-8. **M0 is truncated.** The 601-step M0 is a much weaker baseline than the
-   planned 2997-step one; M1 is matched to it, so the comparison is fair but
-   at a low-competence operating point.
+1. **Training text has no end-of-sequence token (verified), effect not
+   separately isolated from the training-budget limitation.**
+   `format_sft_example()` builds `prompt + "\n" + code` with no EOS token
+   appended, and generation showed batch times that were nearly constant
+   (consistent with runs hitting the token cap rather than stopping early).
+   This may be contributing to the high `syntax_error` rates alongside the
+   more fundamental 601-step undertraining -- the two haven't been
+   disentangled. Fix options: (a) stop generation at the first `endmodule`
+   (no retraining, helps evaluation immediately); (b) append
+   `tokenizer.eos_token` to training text and retrain (correct long-term
+   fix, costs a new M0 and M1). Also: loss is computed over prompt tokens
+   as well as code (no prompt masking) -- a smaller issue, worth a line in
+   the write-up regardless.
+2. **Unresolved fp16 instability on T4.** Never occurred in either final
+   retrain (both at `lr=1e-4`, both clean), but the root cause from the
+   original NaN saga (Section 5.3) was never found, only contained by the
+   guards. Longer training runs on this hardware should expect to hit it
+   again and use the same playbook.
+3. **Small sample, single seed.** 30 problems, one seed, is not enough
+   statistical power to rule out a small real effect -- it can only detect
+   a large one, and didn't. Don't claim "the curriculum doesn't work"; claim
+   "no effect was detected at this sample size and training budget."
+4. **Both models are still undertrained relative to the original design.**
+   601 of 2997 planned steps (~20%). More training, not more eval samples,
+   is the highest-value next spend if further GPU-hour budget becomes
+   available -- see Section 8.
+5. **Broad construct regexes.** Tags like `blocking_assign` and `arithmetic`
+   match a large share of all code, so they carry limited discriminating
+   information even with a well-trained model (Section 5.6's fix corrected
+   *which* table gets used, not the underlying tag granularity).
+6. **Bootstrap gaps.** Kaggle notebooks' bootstrap cells don't restore
+   `run_meta.json` or `m0_diagnostic.json` automatically; restore them by
+   hand from the attached Dataset (`find /kaggle/input -iname ...` first,
+   then `cp` -- never assume a path, Kaggle's mount convention varies
+   session to session).
+7. **`docs/industry_standards.md`'s lint/synthesize stages were soft-gated
+   throughout the actual eval run** (`require_lint_clean=False` by default
+   in `verify()`) -- the reported numbers reflect compile+simulate
+   correctness, not full industry-standard-RTL cleanliness. Worth being
+   explicit about this scope in the write-up.
 
 ---
 
 ## 8. What to do next
 
-1. Before M1, do the cheap check in Section 7 item 1 (look at raw samples).
-   If the model does not stop at `endmodule`, decide whether to fix it first,
-   because it would change both M0 and M1.
-2. Upload `m0_probe_gens.jsonl` and `m0_diagnostic.json` to a Dataset.
-3. Run M1: `!git pull`, then
-   `!python -m src.train.sft --config configs/m1_curriculum_kaggle.yaml 2>&1 | tee -a artifacts/m1_stdout.log`.
-   Look for the two lines `inherited S=601` and `assertion passed`.
-4. Quick Save after each checkpoint (steps 200, 400, 600). Do not stop the
-   session by mistake.
-5. If NaN or sustained non-finite messages appear: interrupt, check the last
-   checkpoint's tensors for NaN, then
-   `python -m scripts.finalize_m0 --checkpoint artifacts/m1/checkpoint-N --config configs/m1_curriculum_kaggle.yaml`.
-6. Port evaluation to Kaggle, run the 2x2 with pass@k and bootstrap CIs.
-7. Write up, including Section 9.
+The pipeline is now correct end to end and has produced one real result. From
+here it's a question of how much further GPU-hour budget is available:
+
+1. **If budget allows: more training steps, not more eval.** Both models are
+   at ~20% of the original plan. Re-running eval on two already-near-floor
+   models mostly narrows confidence intervals around zero; it won't reveal a
+   real difference that more training hasn't produced yet. Resuming M0 and
+   M1 further (same configs, same `lr=1e-4`, matched step counts) is the
+   highest-value next spend.
+2. **If concluding now:** write up the null result honestly (Section 9),
+   including the per-category nuance and the `pass@5`-for-repair-on caveat.
+   A defensible null result, clearly explained, is a legitimate dissertation
+   finding.
+3. Either way: do the cheap EOS-token check (Section 7, item 1) before
+   trusting any future syntax-error-rate comparison -- it's a real unknown
+   that could be inflating the numbers for both models equally, which
+   wouldn't change the *comparison* but would change the *absolute* rates
+   reported.
+4. If more eval is wanted regardless: increase `SEEDS` in
+   `notebooks/07_eval_kaggle.ipynb` first (gives the cross-seed std the
+   analysis cells are built to show) before increasing `LIMIT` -- knowing
+   whether an effect is inside noise matters more than a larger single-seed
+   sample.
 
 ---
 
 ## 9. Suggested limitations text for the dissertation
 
-> M0 was trained for 601 of the 2997 planned optimizer steps. Repeated fp16
-> numerical instability on Tesla T4 GPUs (no native bf16) caused non-finite
-> losses; gradient clipping, per-example non-finite exclusion, and a lowered
-> learning rate contained but did not eliminate it, and a mixed-precision
-> alternative was tried and reverted after it degraded resume behaviour. Training was stopped at the last checkpoint whose
-> adapter weights were verified finite. M1 was trained for the same number of
-> steps and at the same learning rate as M0's final configuration to preserve a
-> one-variable ablation. Because M0 failed almost uniformly on the held-out
-> probe split (all sampled failures were syntax errors), the error-driven
-> component of the curriculum had limited discriminating signal; results
-> should be read as primarily testing structural tier phasing.
+> M0 and M1 were each trained for 601 of the 2997 originally planned
+> optimizer steps, a deliberate budget decision made after extensive fp16
+> numerical instability on Tesla T4 GPUs (no native bf16 support) required
+> multiple recovery iterations -- gradient clipping, per-example non-finite
+> exclusion, and a lowered learning rate (1e-4, applied to both models to
+> preserve a one-variable ablation) contained the instability without fully
+> eliminating its root cause. A separate bug was found and fixed in the
+> inference path: the base model was being loaded at full precision rather
+> than matching the 4-bit quantization used during training, which produced
+> completely degenerate generations regardless of the underlying adapter
+> quality; all reported results are from the corrected pipeline. Evaluation
+> (VerilogEval/RTLLM, n=5 samples per problem, 30-problem random subsample,
+> single seed) found no detectable difference between the flat-sampled
+> baseline (M0) and the curriculum-trained model (M1) on pass@1 or pass@5
+> (both 3.3% and 13.3% respectively), and found the compiler-feedback repair
+> loop to be neutral-to-harmful for both models at this competence level
+> (M0: 0 of 30 problems resolved in up to 3 repair attempts; M1: 1 of 30).
+> Given the small sample size and single seed, this should be read as "no
+> effect was detected at this training budget," not as evidence the
+> curriculum or repair mechanisms do not work; both models remain
+> substantially undertrained relative to the original 2997-step design, and
+> a meaningful test of either hypothesis would require completing that
+> training budget before re-evaluating.
 
 ---
 
@@ -626,15 +825,20 @@ Read these before drawing conclusions from M0 or M1.
 | File | Purpose |
 |---|---|
 | `src/train/sft.py` | wall-clock stop, gradient clipping, non-finite guards, per-example exclusion, LR override on resume, NaN-EMA reset, construct-keyed reweighting input |
-| `src/infer/generate.py` | tokenizer from base model, left padding, single GPU, `--limit`, `--max-new-tokens`, progress/ETA |
+| `src/infer/generate.py` | tokenizer from base model, left padding, single GPU, **quantized model loading matching training** (the big one -- Section 5.9), `--limit`, `--max-new-tokens`, progress/ETA |
+| `src/eval/run_eval.py` | `--limit`, `--max-new-tokens`, per-problem progress+ETA on the repair path, **fixed `row["tier"]` to `row["tags"]["tier"]`** (Section 5.11) |
 | `src/eval/metrics.py` | `construct_failure_rate_table()` |
 | `src/eval/diagnose.py` | carries construct tags, writes `construct_failure_rates` |
-| `tests/test_metrics.py` | regression test for the construct table |
+| `tests/test_metrics.py`, `tests/test_run_eval.py` | regression tests for the construct table and the eval-set tier schema |
 | `scripts/finalize_m0.py` | finalize any run early at a chosen checkpoint |
-| `configs/m0_baseline_kaggle.yaml` | M0 on Kaggle (`max_wall_hours`) |
-| `configs/m0_baseline_kaggle_recovery.yaml` | M0 with lr 1e-4 |
+| `scripts/ask.py` | single-question CLI: one spec in, one generated module out |
+| `configs/m0_baseline_kaggle.yaml`, `..._recovery.yaml` | M0 on Kaggle, then with lr 1e-4 |
+| `configs/m0_retrain_kaggle.yaml` | clean-slate M0 retrain, lr 1e-4 from step 0, capped at 601 steps |
 | `configs/m1_curriculum_kaggle.yaml` | M1 on Kaggle (`max_wall_hours`, lr 1e-4) |
-| `notebooks/02_train_kaggle.ipynb` | Kaggle bootstrap, M0, diagnostic pass, M1 |
+| `notebooks/02_train_kaggle.ipynb` | Kaggle bootstrap, M0 (now the retrain config), diagnostic pass, M1 |
+| `notebooks/05_generation_check_kaggle.ipynb` | the M0-vs-M1-vs-base generation A/B test that found the quantization bug |
+| `notebooks/06_ask_kaggle.ipynb` | live Q&A web page (Gradio) for a trained adapter |
+| `notebooks/07_eval_kaggle.ipynb` | Kaggle port of the 2x2 eval, sized for a single session |
 
 ### Commit log (newest last)
 
@@ -657,6 +861,11 @@ Read these before drawing conclusions from M0 or M1.
 | 6cc428b | single-GPU inference |
 | 35bca91 | fix silent no-op reweighting |
 | 6b5d54c | M1 lr matched to M0 |
+| 9a9deef | `scripts/ask.py`, Kaggle Q&A page, this document (first version) |
+| b189f7d | M0 retrain capped at 601 steps |
+| ed2878a | **quantized model loading in `generate.py`** -- the big fix |
+| 9ca7efb | eval sized for Kaggle: `--limit`, `--max-new-tokens`, progress logging |
+| 1d281e1 | fixed `row["tier"]` KeyError -- eval-set tier is nested under `tags` |
 
 ### Lessons worth remembering
 
@@ -664,7 +873,14 @@ Read these before drawing conclusions from M0 or M1.
   contents, which folder a path lands in).
 - A failure that reproduces at the same step under a different setting is not
   caused by that setting.
-- A silent no-op is worse than a crash: the reweighting bug and the skipped
-  restore both looked like success.
-- Make long jobs report progress and save state; assume any session can vanish.
+- A silent no-op is worse than a crash: the reweighting bug, the tokenizer
+  dtype-vs-quantization bug, and the skipped restore all looked like success
+  or produced *output* that had to be inspected by hand to reveal it was
+  wrong -- none of them raised an exception.
+- Make long jobs report progress and save state; assume any session can
+  vanish -- one full training run was lost this way and had to be redone.
 - When a fix makes things worse, revert it on evidence and say so.
+- When two runs disagree, hold everything else constant and change one
+  thing at a time (the base-model-alone / adapter-attached / adapter-merged
+  A/B test is what actually found the quantization bug -- guessing first
+  would have wasted more GPU-hours than the test cost).
